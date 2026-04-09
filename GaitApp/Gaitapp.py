@@ -992,17 +992,18 @@ class GaitAnalysisDashboard(tk.Tk):
                        activebackground=ACCENT, activeforeground='white')
 
         buttons = [
-            ("Prev",       self._prev_frame),
-            ("Next",       self._next_frame),
-            ("Play",       self._toggle_play),
-            ("Cycles",     self._toggle_cycles),
-            ("World/Px",   self._toggle_world),
-            ("Graph V",    self._cycle_graph_view),
-            ("Active V",   self._toggle_active),
-            ("Auto steps", self._recompute_steps),
-            ("Show Sugg",  self._toggle_suggestions),
-            ("Clr steps",  self._clear_steps),
-            ("Clr Excl",   self._clear_exclusions),
+            ("Prev",         self._prev_frame),
+            ("Next",         self._next_frame),
+            ("Play",         self._toggle_play),
+            ("Cycles",       self._toggle_cycles),
+            ("World/Px",     self._toggle_world),
+            ("Graph V",      self._cycle_graph_view),
+            ("Active V",     self._toggle_active),
+            ("Auto steps",   self._recompute_steps),
+            ("Show Sugg",    self._toggle_suggestions),
+            ("Clr steps",    self._clear_steps),
+            ("Clr Excl",     self._clear_exclusions),
+            ("Export Excel", self._export_excel),
         ]
         for txt, cmd in buttons:
             tk.Button(bar, text=txt, command=cmd, **btn_cfg).pack(side='left', padx=2, pady=3)
@@ -2077,6 +2078,170 @@ class GaitAnalysisDashboard(tk.Tk):
         tk.Button(win, text="Close", command=win.destroy,
                   bg=ACCENT, fg='white', relief='flat', padx=14
                   ).grid(row=len(HELP_TEXT), column=0, columnspan=2, pady=14)
+
+    # export
+    def _export_excel(self):
+        if len(self.datasets) < 2:
+            messagebox.showwarning("Export", "Please load two videos first.", parent=self)
+            return
+
+        default_name = f"gait_{self.video_names[0]}_vs_{self.video_names[1]}.xlsx"
+        # sanitize filename
+        for ch in r'\/:*?"<>|':
+            default_name = default_name.replace(ch, '_')
+
+        path = filedialog.asksaveasfilename(
+            parent=self,
+            title="Save Excel report",
+            defaultextension=".xlsx",
+            filetypes=[("Excel files", "*.xlsx"), ("All files", "*.*")],
+            initialfile=default_name,
+        )
+        if not path:
+            return
+
+        try:
+            import openpyxl
+            from openpyxl.utils.dataframe import dataframe_to_rows
+            from openpyxl.drawing.image import Image as XLImage
+            from openpyxl.styles import Font, PatternFill, Alignment
+        except ImportError:
+            messagebox.showerror(
+                "Missing package",
+                "openpyxl is required for Excel export.\n\nInstall with: pip install openpyxl",
+                parent=self,
+            )
+            return
+
+        try:
+            wb = openpyxl.Workbook()
+
+            # ── Sheet 1: Summary ──────────────────────────────────────────────
+            ws_sum = wb.active
+            ws_sum.title = "Summary"
+
+            hdr_font  = Font(bold=True)
+            hdr_fill  = PatternFill("solid", fgColor="D0D0D0")
+
+            def _hdr(ws, row_data):
+                ws.append(row_data)
+                for cell in ws[ws.max_row]:
+                    cell.font  = hdr_font
+                    cell.fill  = hdr_fill
+
+            # Video names row
+            _hdr(ws_sum, ["", self.video_names[0], self.video_names[1]])
+
+            # Joint stats
+            ws_sum.append([])
+            _hdr(ws_sum, ["Joint", "V1 Mean (°)", "V1 Peak (°)", "V2 Mean (°)", "V2 Peak (°)"])
+            joint_order = [
+                'left_hip', 'right_hip', 'left_knee',
+                'right_knee', 'left_ankle', 'right_ankle',
+            ]
+            for joint in joint_order:
+                a1 = self.datasets[0]['angle_data']
+                a2 = self.datasets[1]['angle_data']
+                m1, p1 = _joint_stats(a1, joint)
+                m2, p2 = _joint_stats(a2, joint)
+                ws_sum.append([
+                    joint.replace('_', ' ').title(),
+                    round(m1, 2), round(p1, 2),
+                    round(m2, 2), round(p2, 2),
+                ])
+
+            # Gait metrics
+            ws_sum.append([])
+            _hdr(ws_sum, ["Gait Metric", "Unit", "% Change (V1 → V2)"])
+            metrics = compute_metrics(self.datasets[0], self.datasets[1])
+            for key in METRIC_ORDER:
+                label, unit = METRIC_LABELS[key]
+                ws_sum.append([label, unit, round(metrics[key], 2)])
+
+            # Step counts
+            sf1 = self.datasets[0].get('step_frames', [])
+            sf2 = self.datasets[1].get('step_frames', [])
+            ws_sum.append([])
+            _hdr(ws_sum, ["Step Events", "V1", "V2"])
+            ws_sum.append(["Total steps", len(sf1), len(sf2)])
+            ws_sum.append(["Left steps",
+                           sum(1 for _, s in sf1 if s == 'left'),
+                           sum(1 for _, s in sf2 if s == 'left')])
+            ws_sum.append(["Right steps",
+                           sum(1 for _, s in sf1 if s == 'right'),
+                           sum(1 for _, s in sf2 if s == 'right')])
+
+            # auto-size columns
+            for col in ws_sum.columns:
+                max_len = max((len(str(cell.value)) for cell in col if cell.value), default=8)
+                ws_sum.column_dimensions[col[0].column_letter].width = min(max_len + 4, 40)
+
+            # ── Sheet 2: Graph ────────────────────────────────────────────────
+            ws_graph = wb.create_sheet(title="Graph", index=1)
+            ws_graph["A1"] = "Joint Angle Graph"
+            ws_graph["A1"].font = Font(bold=True, size=12)
+
+            tmp_img_path = None
+            with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp_f:
+                tmp_img_path = tmp_f.name
+            self._fig.savefig(tmp_img_path, dpi=120, bbox_inches='tight',
+                              facecolor=self._fig.get_facecolor())
+            xl_img = XLImage(tmp_img_path)
+            xl_img.anchor = "A2"
+            ws_graph.add_image(xl_img)
+
+            # ── Col rename map ────────────────────────────────────────────────
+            col_rename = {
+                'frame_num':    'Frame',
+                'time_s':       'Time (s)',
+                'left_hip':     'Left Hip (°)',
+                'right_hip':    'Right Hip (°)',
+                'left_knee':    'Left Knee (°)',
+                'right_knee':   'Right Knee (°)',
+                'left_ankle':   'Left Ankle (°)',
+                'right_ankle':  'Right Ankle (°)',
+            }
+
+            def _write_angle_sheet(ws, ds):
+                ad = ds['angle_data'].copy()
+                ad.insert(1, 'time_s', (ad['frame_num'] / SLOWMO_FPS).round(4))
+                ad.rename(columns=col_rename, inplace=True)
+                for i, row in enumerate(dataframe_to_rows(ad, index=False, header=True)):
+                    ws.append(row)
+                    if i == 0:
+                        for cell in ws[ws.max_row]:
+                            cell.font = hdr_font
+                            cell.fill = hdr_fill
+                for col in ws.columns:
+                    ws.column_dimensions[col[0].column_letter].width = 16
+
+            # ── Sheet 3 & 4: Angle data ───────────────────────────────────────
+            ws_v1 = wb.create_sheet(title=f"V1 - {self.video_names[0][:26]}")
+            _write_angle_sheet(ws_v1, self.datasets[0])
+
+            ws_v2 = wb.create_sheet(title=f"V2 - {self.video_names[1][:26]}")
+            _write_angle_sheet(ws_v2, self.datasets[1])
+
+            # ── Sheet 5: Step Events ──────────────────────────────────────────
+            ws_steps = wb.create_sheet(title="Step Events")
+            _hdr(ws_steps, ["Video", "Frame", "Time (s)", "Side"])
+            for f, s in sf1:
+                ws_steps.append([self.video_names[0], f, round(f / SLOWMO_FPS, 3), s])
+            for f, s in sf2:
+                ws_steps.append([self.video_names[1], f, round(f / SLOWMO_FPS, 3), s])
+            for col in ws_steps.columns:
+                ws_steps.column_dimensions[col[0].column_letter].width = 18
+
+            wb.save(path)
+
+            if tmp_img_path and os.path.exists(tmp_img_path):
+                os.unlink(tmp_img_path)
+
+            self._status_msg.set(f"Exported: {os.path.basename(path)}")
+            messagebox.showinfo("Export Complete", f"Report saved to:\n{path}", parent=self)
+
+        except Exception as e:
+            messagebox.showerror("Export Error", f"Export failed:\n{e}", parent=self)
 
     # close
     def _on_close(self):
