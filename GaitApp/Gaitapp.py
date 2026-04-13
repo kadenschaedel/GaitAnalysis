@@ -1,7 +1,10 @@
 # standard imports
 import atexit
 import gc
+import hashlib
+import json
 import os
+import pickle
 import signal
 import sys
 import tempfile
@@ -16,10 +19,6 @@ import matplotlib
 matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-import mediapipe as mp
-from mediapipe.tasks import python as mp_python
-from mediapipe.tasks.python import vision as mp_vision
-from mediapipe.tasks.python.vision import PoseLandmarker, PoseLandmarkerOptions, RunningMode
 import numpy as np
 import pandas as pd
 from PIL import Image, ImageTk
@@ -45,6 +44,8 @@ FILTER_ORDER  = 4
 SAVE_HEIGHT  = 540
 JPEG_QUALITY = 65
 CACHE_FRAMES = 96
+DEBUG_DIRECTION_DIAGNOSTICS = False
+CACHE_SCHEMA_VERSION = 1
 
 # pose model path
 MODEL_PATH = resource_path("pose_landmarker_full.task")
@@ -52,11 +53,168 @@ MODEL_URL  = ("https://storage.googleapis.com/mediapipe-models/"
               "pose_landmarker/pose_landmarker_full/float16/1/"
               "pose_landmarker_full.task")
 
+_mp_bindings = None
+_mp_lock = threading.Lock()
+
+
 def ensure_model():
     if not os.path.exists(MODEL_PATH):
         print(f"Downloading PoseLandmarker model to {MODEL_PATH} ...")
         urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
         print("Download complete.")
+
+
+def get_mediapipe_bindings():
+    global _mp_bindings
+    if _mp_bindings is not None:
+        return _mp_bindings
+    with _mp_lock:
+        if _mp_bindings is None:
+            import mediapipe as mp
+            from mediapipe.tasks import python as mp_python
+            from mediapipe.tasks.python.vision import PoseLandmarker, PoseLandmarkerOptions, RunningMode
+
+            _mp_bindings = (mp, mp_python, PoseLandmarker, PoseLandmarkerOptions, RunningMode)
+    return _mp_bindings
+
+
+def _cache_root_dir():
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(root, "Clients", ".gait_cache")
+
+
+def _cache_dir(cache_key):
+    return os.path.join(_cache_root_dir(), cache_key)
+
+
+def _video_metadata(video_path):
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return {
+            'size_bytes': os.path.getsize(video_path),
+            'frame_count': 0,
+            'fps': 0.0,
+            'width': 0,
+            'height': 0,
+        }
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+    cap.release()
+    return {
+        'size_bytes': os.path.getsize(video_path),
+        'frame_count': frame_count,
+        'fps': fps,
+        'width': width,
+        'height': height,
+    }
+
+
+def _file_sha256(video_path, chunk_size=4 * 1024 * 1024):
+    h = hashlib.sha256()
+    with open(video_path, 'rb') as f:
+        while True:
+            chunk = f.read(chunk_size)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _build_cache_key(scan_info, target_output_size):
+    payload = {
+        'schema': CACHE_SCHEMA_VERSION,
+        'video_sha256': scan_info.get('video_sha256'),
+        'video_meta': scan_info.get('video_meta'),
+        'save_height': SAVE_HEIGHT,
+        'jpeg_quality': JPEG_QUALITY,
+        'filter_cutoff': FILTER_CUTOFF,
+        'filter_order': FILTER_ORDER,
+        'target_output_size': list(target_output_size) if target_output_size else None,
+    }
+    raw = json.dumps(payload, sort_keys=True).encode('utf-8')
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _load_cached_video_result(cache_key):
+    path = os.path.join(_cache_dir(cache_key), 'result.pkl')
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, 'rb') as f:
+            payload = pickle.load(f)
+        if payload.get('schema') != CACHE_SCHEMA_VERSION:
+            return None
+        result = payload.get('result')
+        if not isinstance(result, dict):
+            return None
+        return result
+    except Exception:
+        return None
+
+
+def _save_cached_video_result(cache_key, cache_meta, result):
+    cdir = _cache_dir(cache_key)
+    os.makedirs(cdir, exist_ok=True)
+
+    manifest_path = os.path.join(cdir, 'manifest.json')
+    with open(manifest_path, 'w', encoding='utf-8') as f:
+        json.dump(cache_meta, f, indent=2)
+
+    payload_path = os.path.join(cdir, 'result.pkl')
+    with open(payload_path, 'wb') as f:
+        pickle.dump({'schema': CACHE_SCHEMA_VERSION, 'result': result}, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+
+def _markup_cache_path(cache_key):
+    return os.path.join(_cache_dir(cache_key), 'markup.json')
+
+
+def _load_cached_markup(cache_key):
+    path = _markup_cache_path(cache_key)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            payload = json.load(f)
+        if payload.get('schema') != CACHE_SCHEMA_VERSION:
+            return None
+        step_frames = []
+        for item in payload.get('step_frames', []):
+            if isinstance(item, (list, tuple)) and len(item) == 2:
+                step_frames.append((int(item[0]), str(item[1])))
+        excluded_regions = []
+        for item in payload.get('excluded_regions', []):
+            if isinstance(item, (list, tuple)) and len(item) == 2:
+                excluded_regions.append((int(item[0]), int(item[1])))
+        return {
+            'step_frames': step_frames,
+            'excluded_regions': excluded_regions,
+        }
+    except Exception:
+        return None
+
+
+def _save_cached_markup(cache_key, step_frames, excluded_regions):
+    cdir = _cache_dir(cache_key)
+    os.makedirs(cdir, exist_ok=True)
+    payload = {
+        'schema': CACHE_SCHEMA_VERSION,
+        'step_frames': [[int(f), str(side)] for f, side in step_frames],
+        'excluded_regions': [[int(start), int(end)] for start, end in excluded_regions],
+    }
+    with open(_markup_cache_path(cache_key), 'w', encoding='utf-8') as f:
+        json.dump(payload, f, indent=2)
+
+
+def _clear_cached_markup(cache_key):
+    path = _markup_cache_path(cache_key)
+    if os.path.exists(path):
+        try:
+            os.remove(path)
+        except Exception:
+            pass
 
 
 # pose landmark indices
@@ -204,17 +362,24 @@ SimpleLandmark = namedtuple('SimpleLandmark', ['x', 'y', 'visibility'])
 GRAY_BGR = (128, 128, 128)
 
 # drawing and analysis helpers
-def draw_pose_landmarks_on_frame(frame_bgr, pixel_landmarks, joint_visibility=None):
+def draw_pose_landmarks_on_frame(frame_bgr, pixel_landmarks, joint_visibility=None, focus_side=None):
     h, w = frame_bgr.shape[:2]
     # keep skeleton thickness consistent across crop sizes
     line_thickness = max(1, int(h * DRAW_THICKNESS / 540))
     circle_radius  = max(1, int(h * 4 / 540))
-    default_line_col = (200, 200, 200)  # fallback color for non tracked joints
+    default_line_col = GRAY_BGR if focus_side in ('left', 'right') else (200, 200, 200)
+
+    def _side_matches(jname):
+        if focus_side not in ('left', 'right'):
+            return True
+        return jname.startswith(focus_side + '_')
     
     def _resolve_color(landmark_idx, base_color):
         if landmark_idx not in LANDMARK_TO_JOINT_NAME:
-            return base_color
+            return GRAY_BGR if focus_side in ('left', 'right') else base_color
         jname = LANDMARK_TO_JOINT_NAME[landmark_idx]
+        if not _side_matches(jname):
+            return GRAY_BGR
         if joint_visibility is not None and not joint_visibility.get(jname, True):
             return GRAY_BGR
         return JOINT_COLORS_BGR[jname]
@@ -243,7 +408,7 @@ def draw_pose_landmarks_on_frame(frame_bgr, pixel_landmarks, joint_visibility=No
             if idx in LANDMARK_TO_JOINT_NAME:
                 joint_color = _resolve_color(idx, (255, 0, 255))
             else:
-                joint_color = (255, 0, 255)  # magenta for non tracked joints
+                joint_color = GRAY_BGR if focus_side in ('left', 'right') else (255, 0, 255)
             
             cv2.circle(frame_bgr, (int(lm.x*w), int(lm.y*h)), circle_radius, joint_color, -1)
     
@@ -400,8 +565,9 @@ def detect_steps(angle_df, fps=240.0, min_step_time=0.4, refine_radius=5):
     return steps
 
 
-def _get_cropped_dimensions(video_path, needs_rotation):
-    crop_rect = detect_crop_region(video_path, needs_rotation)
+def _get_cropped_dimensions(video_path, needs_rotation, crop_rect=None):
+    if crop_rect is None:
+        crop_rect = detect_crop_region(video_path, needs_rotation)
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         return None
@@ -540,6 +706,8 @@ def _log_direction_diagnostics(df_w, df_p, video_path, detected_rotation):
 
 # video processing
 def _detect_subject_orientation(video_path):
+    mp, mp_python, PoseLandmarker, PoseLandmarkerOptions, RunningMode = get_mediapipe_bindings()
+
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         return False
@@ -602,16 +770,33 @@ def _detect_subject_orientation(video_path):
     return vertical_votes > detections / 2
 
 
-def process_video(video_path, ann_dir, progress_cb, status_cb, target_output_size=None):
-    status_cb("Detecting subject orientation…")
-    needs_rotation = _detect_subject_orientation(video_path)
+def process_video(video_path, ann_dir, progress_cb, status_cb,
+                  target_output_size=None, needs_rotation=None,
+                  crop_rect=None, cache_key=None, cache_meta=None):
+    mp, mp_python, PoseLandmarker, PoseLandmarkerOptions, RunningMode = get_mediapipe_bindings()
+
+    cached_markup = _load_cached_markup(cache_key) if cache_key else None
+
+    if cache_key:
+        cached = _load_cached_video_result(cache_key)
+        if cached is not None:
+            cached['_cache_key'] = cache_key
+            cached['_cache_meta'] = cache_meta or {}
+            cached['_cached_markup'] = cached_markup
+            status_cb("Loaded cached analysis")
+            return cached
+
+    if needs_rotation is None:
+        status_cb("Detecting subject orientation…")
+        needs_rotation = _detect_subject_orientation(video_path)
     if needs_rotation:
         status_cb("Subject is upright — rotating 90° CCW for analysis")
     else:
         status_cb("Subject is sideways — no rotation needed")
 
     # detect black borders for cropping
-    crop_rect = detect_crop_region(video_path, needs_rotation)
+    if crop_rect is None:
+        crop_rect = detect_crop_region(video_path, needs_rotation)
     
     # calculate the cropped frame size
     cropped_size = None
@@ -644,6 +829,11 @@ def process_video(video_path, ann_dir, progress_cb, status_cb, target_output_siz
 
     world_rows, pixel_rows, landmarks, landmark_depths = [], [], [], []
     frame_count = 0
+
+    frame_output_dir = ann_dir
+    if cache_key:
+        frame_output_dir = os.path.join(_cache_dir(cache_key), 'frames')
+        os.makedirs(frame_output_dir, exist_ok=True)
 
     while cap.isOpened():
         ret, frame = cap.read()
@@ -693,7 +883,7 @@ def process_video(video_path, ann_dir, progress_cb, status_cb, target_output_siz
             if SAVE_HEIGHT and h > SAVE_HEIGHT:
                 nw = int(w * SAVE_HEIGHT / h)
                 raw = cv2.resize(raw, (nw, SAVE_HEIGHT), interpolation=cv2.INTER_AREA)
-            raw_path = os.path.join(ann_dir, f"raw_{frame_count:06d}.jpg")
+            raw_path = os.path.join(frame_output_dir, f"raw_{frame_count:06d}.jpg")
             cv2.imwrite(raw_path, raw, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
 
             # map padded landmark coordinates back into view frame space
@@ -769,12 +959,13 @@ def process_video(video_path, ann_dir, progress_cb, status_cb, target_output_siz
     df_p = pd.DataFrame(pixel_rows)
     df_depths = pd.DataFrame([d for d in landmark_depths if d is not None])
 
-    # save diagnostics before any later corrections
-    try:
-        diag_path, raw_path = _log_direction_diagnostics(df_w, df_p, video_path, 0)
-        status_cb(f"Diagnostics saved: {os.path.basename(diag_path)}")
-    except Exception as e:
-        status_cb(f"Diagnostic logging failed: {e}")
+    # diagnostics are noisy and slow, keep them opt-in only
+    if DEBUG_DIRECTION_DIAGNOSTICS:
+        try:
+            diag_path, raw_path = _log_direction_diagnostics(df_w, df_p, video_path, 0)
+            status_cb(f"Diagnostics saved: {os.path.basename(diag_path)}")
+        except Exception as e:
+            status_cb(f"Diagnostic logging failed: {e}")
 
     for df in (df_w, df_p):
         for col in df.columns:
@@ -792,7 +983,7 @@ def process_video(video_path, ann_dir, progress_cb, status_cb, target_output_siz
     del world_rows, pixel_rows
     gc.collect()
 
-    return {
+    result = {
         'df_world':       df_w,
         'df_pixel':       df_p,
         'angle_data':     ad,
@@ -802,7 +993,15 @@ def process_video(video_path, ann_dir, progress_cb, status_cb, target_output_siz
         'all_landmarks':  landmarks,   # each item stores a raw path and pixel landmarks
         'landmark_depths': df_depths,
         'needs_rotation': needs_rotation,
+        '_cache_key':     cache_key,
+        '_cache_meta':    cache_meta or {},
+        '_cached_markup': cached_markup,
     }
+
+    if cache_key:
+        _save_cached_video_result(cache_key, cache_meta or {}, result)
+
+    return result
 
 
 # gait metrics
@@ -1009,10 +1208,15 @@ class GaitAnalysisDashboard(tk.Tk):
         except FileNotFoundError:
             pass
 
-        tk.Label(hdr, text="novita gait analysis",
+        tk.Label(hdr, text="NOVITA GAIT ANALYSIS",
                  font=("Coiny Cyrillic", 17), bg=BG2, fg=ACCENT,
                  ).pack(side='left', pady=(6, 0))
 
+        tk.Button(hdr, text="Re-mark", font=("Helvetica", 9),
+              bg=BG3, fg=TEXT, relief='flat', padx=8,
+              command=self._restart_marking_wizard
+              ).pack(side='right', padx=2, pady=8)
+        
         tk.Button(hdr, text="Select", font=("Helvetica", 9),
                   bg=BG3, fg=TEXT, relief='flat', padx=8,
                   command=self.find_videos
@@ -1164,7 +1368,7 @@ class GaitAnalysisDashboard(tk.Tk):
         self._clear_btns = {}
         for label, key, cmd in [
             ("Clear Steps", "clear_steps", self._clear_steps),
-            ("Clear Excl", "clear_excl", self._clear_exclusions),
+            ("Clear Excluded Zone", "clear_excl", self._clear_exclusions),
         ]:
             btn = tk.Button(self._legend_bottom, text=label,
                         font=("Helvetica", 7, "bold"), bg=BG3, fg=TEXT,
@@ -1283,7 +1487,12 @@ class GaitAnalysisDashboard(tk.Tk):
         self.video_names = [os.path.splitext(os.path.basename(p))[0] for p in video_paths]
         self._v1_lbl.config(text=f"Video 1: {self.video_names[0]}")
         self._v2_lbl.config(text=f"Video 2: {self.video_names[1]}")
-        self._status_msg.set("Processing videos… 0%")
+
+        self._status_msg.set("Checking pose model…")
+        self.update()
+        ensure_model()
+
+        self._status_msg.set("Preparing videos…")
 
         session = self._session
         spill1 = os.path.join(session.path, "vid1")
@@ -1293,33 +1502,94 @@ class GaitAnalysisDashboard(tk.Tk):
 
         results          = [None, None]
         results_progress = [0.0, 0.0]
-        
-        # estimate a shared output size from both cropped videos
-        self._status_msg.set("Detecting crop regions…")
-        self.update()
-        target_output_size = None
-        try:
-            sizes = []
-            for path in video_paths:
+
+        pre_scan = [None, None]
+
+        def _scan_video(i, path):
+            try:
                 needs_rot = _detect_subject_orientation(path)
-                dims = _get_cropped_dimensions(path, needs_rot)
-                if dims:
-                    sizes.append(dims)
-            
+                crop_rect = detect_crop_region(path, needs_rot)
+                dims = _get_cropped_dimensions(path, needs_rot, crop_rect=crop_rect)
+                pre_scan[i] = {
+                    'needs_rotation': needs_rot,
+                    'crop_rect': crop_rect,
+                    'dims': dims,
+                    'video_meta': _video_metadata(path),
+                    'video_sha256': _file_sha256(path),
+                }
+            except Exception as e:
+                pre_scan[i] = {'error': str(e)}
+
+        scan_threads = [
+            threading.Thread(target=_scan_video, args=(0, video_paths[0]), daemon=True),
+            threading.Thread(target=_scan_video, args=(1, video_paths[1]), daemon=True),
+        ]
+
+        def _start_processing():
+            target_output_size = None
+            sizes = [s.get('dims') for s in pre_scan if isinstance(s, dict) and s.get('dims')]
             if len(sizes) == 2:
-                # use the larger dimensions so both videos fit
                 target_w = max(sizes[0][0], sizes[1][0])
                 target_h = max(sizes[0][1], sizes[1][1])
                 target_output_size = (target_w, target_h)
                 self._status_msg.set(f"Target output: {target_w}x{target_h}")
                 self.update()
-        except Exception as e:
-            print(f"Warning: Could not pre-detect crop size: {e}")
 
-        def _process(i, path, ann_dir):
-            def _prog(p): results_progress[i] = p
-            def _stat(s): self.after(0, lambda: self._status_msg.set(s))
-            results[i] = process_video(path, ann_dir, _prog, _stat, target_output_size=target_output_size)
+            cache_keys = [None, None]
+            cache_meta = [None, None]
+            for i in range(2):
+                info = pre_scan[i] if isinstance(pre_scan[i], dict) else None
+                if not info or info.get('error'):
+                    continue
+                cache_keys[i] = _build_cache_key(info, target_output_size)
+                cache_meta[i] = {
+                    'schema': CACHE_SCHEMA_VERSION,
+                    'video_path': video_paths[i],
+                    'video_meta': info.get('video_meta'),
+                    'video_sha256': info.get('video_sha256'),
+                    'target_output_size': list(target_output_size) if target_output_size else None,
+                }
+
+            self._status_msg.set("Processing videos… 0%")
+
+            def _process(i, path, ann_dir):
+                info = pre_scan[i] if isinstance(pre_scan[i], dict) else {}
+                needs_rot = info.get('needs_rotation')
+                crop_rect = info.get('crop_rect')
+
+                def _prog(p):
+                    results_progress[i] = p
+
+                def _stat(s):
+                    self.after(0, lambda: self._status_msg.set(s))
+
+                results[i] = process_video(
+                    path, ann_dir, _prog, _stat,
+                    target_output_size=target_output_size,
+                    needs_rotation=needs_rot,
+                    crop_rect=crop_rect,
+                    cache_key=cache_keys[i],
+                    cache_meta=cache_meta[i],
+                )
+
+            t1 = threading.Thread(target=_process, args=(0, video_paths[0], spill1), daemon=True)
+            t2 = threading.Thread(target=_process, args=(1, video_paths[1], spill2), daemon=True)
+            t1.start()
+            t2.start()
+            self.after(300, _poll_loading)
+
+        def _poll_pre_scan():
+            done = sum(0 if t.is_alive() else 1 for t in scan_threads)
+            self._status_msg.set(f"Preparing videos… {done}/2")
+            self._update_status()
+            if done < 2:
+                self.after(200, _poll_pre_scan)
+                return
+
+            for i, info in enumerate(pre_scan):
+                if isinstance(info, dict) and info.get('error'):
+                    print(f"Warning: pre-scan failed for video {i+1}: {info['error']}")
+            _start_processing()
 
         def _poll_loading():
             p = (results_progress[0] + results_progress[1]) / 2
@@ -1357,17 +1627,21 @@ class GaitAnalysisDashboard(tk.Tk):
             self.progress     = 1.0
             self.show_overlaid_cycles = False
             self.resample_cycles = False
-            # clear manual steps before guided markup starts
-            for ds in results:
-                if ds:
-                    ds['step_frames'] = []
-            self._enter_marking_phase('left', 0)
+            cached_loaded = self._resolve_cached_markup()
+            if self._start_required_markup_flow():
+                return
+            self.show_overlaid_cycles = True
+            self.resample_cycles = True
+            self._update_display_btn_visuals()
+            self.refresh()
+            if cached_loaded:
+                self._status_msg.set("Loaded cached steps and exclusions")
+            else:
+                self._status_msg.set("Loaded analysis")
 
-        t1 = threading.Thread(target=_process, args=(0, video_paths[0], spill1), daemon=True)
-        t2 = threading.Thread(target=_process, args=(1, video_paths[1], spill2), daemon=True)
-        t1.start()
-        t2.start()
-        self.after(300, _poll_loading)
+        for t in scan_threads:
+            t.start()
+        self.after(200, _poll_pre_scan)
 
     # key bindings
     def _bind_keys(self):
@@ -1422,6 +1696,86 @@ class GaitAnalysisDashboard(tk.Tk):
     def _active_max_index(self):
         ad = self._active_angle_data()
         return len(ad)-1 if (ad is not None and not ad.empty) else -1
+
+    def _persist_dataset_markup(self, ds):
+        if not ds:
+            return
+        cache_key = ds.get('_cache_key')
+        if not cache_key:
+            return
+        _save_cached_markup(
+            cache_key,
+            ds.get('step_frames', []),
+            ds.get('excluded_regions', []),
+        )
+
+    def _persist_all_dataset_markup(self):
+        for ds in self.datasets:
+            self._persist_dataset_markup(ds)
+
+    def _dataset_needs_markup(self, video_idx):
+        if not hasattr(self, '_markup_required_videos'):
+            return True
+        if video_idx >= len(self._markup_required_videos):
+            return True
+        return self._markup_required_videos[video_idx]
+
+    def _next_markup_phase(self, side, video_idx):
+        order = [('left', 0), ('left', 1), ('right', 0), ('right', 1)]
+        try:
+            start_idx = order.index((side, video_idx)) + 1
+        except ValueError:
+            start_idx = 0
+        for next_side, next_video_idx in order[start_idx:]:
+            if self._dataset_needs_markup(next_video_idx):
+                return next_side, next_video_idx
+        return None
+
+    def _resolve_cached_markup(self):
+        self._markup_required_videos = [True] * len(self.datasets)
+        cached_loaded = False
+
+        for i, ds in enumerate(self.datasets):
+            if not ds:
+                continue
+            cached_markup = ds.get('_cached_markup') or {}
+            cached_steps = cached_markup.get('step_frames', [])
+            cached_exclusions = cached_markup.get('excluded_regions', [])
+            has_cached_markup = bool(cached_steps or cached_exclusions)
+            if not has_cached_markup:
+                continue
+
+            vid_name = self.video_names[i] if i < len(self.video_names) else f"Video {i+1}"
+            answer = messagebox.askyesno(
+                "Cached markup found",
+                f"Cached steps or exclusions were found for {vid_name}.\n\n"
+                "Yes = load cached markup\n"
+                "No = overwrite and mark again",
+                parent=self,
+            )
+
+            if answer:
+                ds['step_frames'] = list(cached_steps)
+                ds['excluded_regions'] = list(cached_exclusions)
+                self._markup_required_videos[i] = False
+                cached_loaded = True
+            else:
+                ds['step_frames'] = []
+                ds['excluded_regions'] = []
+                self._markup_required_videos[i] = True
+                cache_key = ds.get('_cache_key')
+                if cache_key:
+                    _clear_cached_markup(cache_key)
+
+        return cached_loaded
+
+    def _start_required_markup_flow(self):
+        order = [('left', 0), ('left', 1), ('right', 0), ('right', 1)]
+        for side, video_idx in order:
+            if self._dataset_needs_markup(video_idx):
+                self._enter_marking_phase(side, video_idx)
+                return True
+        return False
 
     def _get_filtered_angle_data(self, angle_data, excluded_regions):
         if not excluded_regions or angle_data.empty:
@@ -1859,9 +2213,14 @@ class GaitAnalysisDashboard(tk.Tk):
                             target_ds.setdefault('excluded_regions', []).append((start_frame, end_frame))
                             target_ds['excluded_regions'] = self._merge_exclusion_regions(
                                 target_ds['excluded_regions'])
+                            self._persist_dataset_markup(target_ds)
                     
                     self._status_msg.set(f"Excluded frames {start_frame}-{end_frame} in both videos")
-                        #self._recompute_steps()  # recompute with filtered data
+                    current_xlim = self._ax.get_xlim()
+                    self.redraw_graph()
+                    self._ax.set_xlim(current_xlim)
+                    self._update_scrollbar()
+                    #self._recompute_steps()  # recompute with filtered data
             self._exclusion_selecting = False
             self._exclusion_start = None
 
@@ -2147,6 +2506,7 @@ class GaitAnalysisDashboard(tk.Tk):
             if key in ds: ds['angle_data'] = ds[key]
         self.angle_data = self.df_world if USE_WORLD_LANDMARKS else self.df_pixel
         self._status_msg.set("World landmarks" if USE_WORLD_LANDMARKS else "Pixel landmarks")
+        self._update_display_btn_visuals()
         self.redraw_graph()
 
     def _toggle_video_view(self, which):
@@ -2301,9 +2661,9 @@ class GaitAnalysisDashboard(tk.Tk):
                 btn.config(bg=BG3, fg=TEXT, state='normal')
 
         if self.show_overlaid_cycles:
-            self._sidebar_toggle_btns['cycles'].config(bg=ACCENT, fg='white')
+            self._sidebar_toggle_btns['cycles'].config(text="Continuous", bg=ACCENT, fg='white')
         else:
-            self._sidebar_toggle_btns['cycles'].config(bg=BG3, fg=TEXT)
+            self._sidebar_toggle_btns['cycles'].config(text="Cycles", bg=BG3, fg=TEXT)
 
         if USE_WORLD_LANDMARKS:
             self._sidebar_toggle_btns['world_px'].config(text="Pixel", bg=ACCENT, fg='white')
@@ -2347,6 +2707,7 @@ class GaitAnalysisDashboard(tk.Tk):
         
         ds.setdefault('step_frames', []).append((fn, detected_foot))
         ds['step_frames'].sort(key=lambda x: x[0])
+        self._persist_dataset_markup(ds)
         self._status_msg.set(f"Added {detected_foot} step @ frame {fn}")
         self._update_metrics_panel()
         current_xlim = self._ax.get_xlim()
@@ -2355,6 +2716,10 @@ class GaitAnalysisDashboard(tk.Tk):
         self._update_scrollbar()
 
     def _delete_nearest_step(self):
+        if self._marking_phase:
+            self._markup_remove_last()
+            return
+
         # choose the dataset from the current graph view
         if self.graph_show_mode == 'v1' and len(self.datasets) >= 1:
             ds = self.datasets[0]
@@ -2369,6 +2734,7 @@ class GaitAnalysisDashboard(tk.Tk):
         i   = min(range(len(ds['step_frames'])),
                   key=lambda k: abs(ds['step_frames'][k][0] - fn))
         removed = ds['step_frames'].pop(i)
+        self._persist_dataset_markup(ds)
         self._status_msg.set(f"Removed step @ frame {removed[0]}")
         self._update_metrics_panel()
         current_xlim = self._ax.get_xlim()
@@ -2404,6 +2770,7 @@ class GaitAnalysisDashboard(tk.Tk):
         for ds in self.datasets:
             if ds:
                 ds['step_frames'] = []
+                self._persist_dataset_markup(ds)
         self._status_msg.set("Steps cleared from all videos")
         self._update_metrics_panel()
         self.redraw_graph()
@@ -2414,9 +2781,31 @@ class GaitAnalysisDashboard(tk.Tk):
         for ds in self.datasets:
             if ds:
                 ds['excluded_regions'] = []
+                self._persist_dataset_markup(ds)
         self._status_msg.set("All exclusions cleared")
         #self._recompute_steps()  # recalculate steps with full data
         self.redraw_graph()
+
+    def _restart_marking_wizard(self):
+        if len(self.datasets) < 2:
+            messagebox.showwarning("No videos loaded",
+                                   "Load two videos before reopening the step marking wizard.",
+                                   parent=self)
+            return
+
+        for ds in self.datasets:
+            if ds:
+                ds['step_frames'] = []
+                self._persist_dataset_markup(ds)
+
+        self._markup_required_videos = [True] * len(self.datasets)
+
+        self.playing = False
+        if self._play_after_id:
+            self.after_cancel(self._play_after_id)
+            self._play_after_id = None
+
+        self._enter_marking_phase('left', 0)
 
     # guided step marking screen
 
@@ -2451,8 +2840,8 @@ class GaitAnalysisDashboard(tk.Tk):
 
         self._markup_banner_lbl = tk.Label(
             title_row,
-            text="MARKING   LEFT   STEPS  —  VIDEO 1",
-            font=("Helvetica", 13, "bold"), bg=BG2, fg=ACCENT, anchor='w')
+            text="MARKING LEFT STEPS — VIDEO 1",
+            font=("Coiny Cyrillic", 13,), bg=BG2, fg=ACCENT, anchor='w')
         self._markup_banner_lbl.pack(side='left')
 
         self._markup_sub_lbl = tk.Label(
@@ -2535,8 +2924,10 @@ class GaitAnalysisDashboard(tk.Tk):
         t0 = 2 / SLOWMO_FPS
         self._markup_frame_lbl.config(text=f"Frame 3  ({t0:.2f} s)")
 
-        # phase order is left v1, left v2, right v1, right v2
-        phase_num = 1 + (0 if side == 'left' else 2) + video_idx
+        phase_order = [(s, vi) for s, vi in [('left', 0), ('left', 1), ('right', 0), ('right', 1)]
+                       if self._dataset_needs_markup(vi)]
+        phase_num = phase_order.index((side, video_idx)) + 1 if (side, video_idx) in phase_order else 1
+        phase_total = max(1, len(phase_order))
         noun = "LEFT" if side == 'left' else "RIGHT"
         vid_num = video_idx + 1
         vid_name = (self.video_names[video_idx]
@@ -2545,24 +2936,21 @@ class GaitAnalysisDashboard(tk.Tk):
         marker_col = C_LEFT if side == 'left' else C_RIGHT
 
         # choose the next step in the markup flow
-        if side == 'left' and video_idx == 0:
-            continue_txt = "Done  →  Mark LEFT steps on Video 2"
-            continue_cmd = lambda: self._enter_marking_phase('left', 1)
-        elif side == 'left' and video_idx == 1:
-            continue_txt = "Done  →  Mark RIGHT steps on Video 1"
-            continue_cmd = lambda: self._enter_marking_phase('right', 0)
-        elif side == 'right' and video_idx == 0:
-            continue_txt = "Done  →  Mark RIGHT steps on Video 2"
-            continue_cmd = lambda: self._enter_marking_phase('right', 1)
+        next_phase = self._next_markup_phase(side, video_idx)
+        if next_phase is not None:
+            next_side, next_video_idx = next_phase
+            next_side_label = "LEFT" if next_side == 'left' else "RIGHT"
+            continue_txt = f"Done  →  Mark {next_side_label} steps on Video {next_video_idx + 1}"
+            continue_cmd = lambda s=next_side, vi=next_video_idx: self._enter_marking_phase(s, vi)
         else:
             continue_txt = "Finish  →  View Gait Analysis"
             continue_cmd = self._exit_marking_phase
 
         # update the banner widgets
-        self._markup_step_lbl.config(text=f"STEP  {phase_num}  OF  4")
+        self._markup_step_lbl.config(text=f"STEP  {phase_num}  OF  {phase_total}")
         self._markup_side_badge.config(text=f"  {noun}  ", bg=marker_col)
         self._markup_banner_lbl.config(
-            text=f"MARKING   {noun}   STEPS  —  VIDEO {vid_num}")
+            text=f"MARKING {noun} STEPS — VIDEO {vid_num}")
         self._markup_sub_lbl.config(
             text=f"· press  SPACE  to mark each {noun} foot strike  ({vid_name})")
         self._markup_count_lbl.config(fg=marker_col)
@@ -2588,6 +2976,7 @@ class GaitAnalysisDashboard(tk.Tk):
         self._markup_frame.pack_forget()
         self._bottom_bar.pack(fill='x', side='bottom')
         self._main_content.pack(fill='both', expand=True, padx=8, pady=(4, 0))
+        self._persist_all_dataset_markup()
 
         # switch into overlaid cycles when markup is complete
         self.show_overlaid_cycles = True
@@ -2623,7 +3012,8 @@ class GaitAnalysisDashboard(tk.Tk):
 
         if pixel_lm is not None:
             frame = frame.copy()
-            draw_pose_landmarks_on_frame(frame, pixel_lm, self.joint_visibility)
+            draw_pose_landmarks_on_frame(frame, pixel_lm, self.joint_visibility,
+                                         focus_side=self._marking_phase)
 
         frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -2726,6 +3116,7 @@ class GaitAnalysisDashboard(tk.Tk):
             fn = int(ds['angle_data']['frame_num'].iloc[idx])
             ds.setdefault('step_frames', []).append((fn, side))
             ds['step_frames'].sort(key=lambda x: x[0])
+            self._persist_dataset_markup(ds)
         self._markup_count_update()
         self._redraw_markup_graph()
 
@@ -2741,6 +3132,7 @@ class GaitAnalysisDashboard(tk.Tk):
             for i in range(len(ds['step_frames']) - 1, -1, -1):
                 if ds['step_frames'][i][1] == side:
                     ds['step_frames'].pop(i)
+                    self._persist_dataset_markup(ds)
                     break
         self._markup_count_update()
         self._redraw_markup_graph()
@@ -2792,7 +3184,6 @@ class SessionTempDir:
 # entry point
 
 def main():
-    ensure_model()
     app = GaitAnalysisDashboard()
     app._session = SessionTempDir()
     app._status_msg.set("Select two videos to begin")
