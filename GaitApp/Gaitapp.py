@@ -184,25 +184,19 @@ def _load_cached_markup(cache_key):
         for item in payload.get('step_frames', []):
             if isinstance(item, (list, tuple)) and len(item) == 2:
                 step_frames.append((int(item[0]), str(item[1])))
-        excluded_regions = []
-        for item in payload.get('excluded_regions', []):
-            if isinstance(item, (list, tuple)) and len(item) == 2:
-                excluded_regions.append((int(item[0]), int(item[1])))
         return {
             'step_frames': step_frames,
-            'excluded_regions': excluded_regions,
         }
     except Exception:
         return None
 
 
-def _save_cached_markup(cache_key, step_frames, excluded_regions):
+def _save_cached_markup(cache_key, step_frames):
     cdir = _cache_dir(cache_key)
     os.makedirs(cdir, exist_ok=True)
     payload = {
         'schema': CACHE_SCHEMA_VERSION,
         'step_frames': [[int(f), str(side)] for f, side in step_frames],
-        'excluded_regions': [[int(start), int(end)] for start, end in excluded_regions],
     }
     with open(_markup_cache_path(cache_key), 'w', encoding='utf-8') as f:
         json.dump(payload, f, indent=2)
@@ -215,6 +209,31 @@ def _clear_cached_markup(cache_key):
             os.remove(path)
         except Exception:
             pass
+
+
+def _ui_settings_path():
+    return os.path.join(_cache_root_dir(), 'ui_settings.json')
+
+
+def _load_ui_settings():
+    path = _ui_settings_path()
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            payload = json.load(f)
+        return payload if isinstance(payload, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_ui_settings(data):
+    try:
+        os.makedirs(_cache_root_dir(), exist_ok=True)
+        with open(_ui_settings_path(), 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2)
+    except Exception:
+        pass
 
 
 # pose landmark indices
@@ -362,11 +381,17 @@ SimpleLandmark = namedtuple('SimpleLandmark', ['x', 'y', 'visibility'])
 GRAY_BGR = (128, 128, 128)
 
 # drawing and analysis helpers
-def draw_pose_landmarks_on_frame(frame_bgr, pixel_landmarks, joint_visibility=None, focus_side=None):
+def draw_pose_landmarks_on_frame(frame_bgr, pixel_landmarks, joint_visibility=None, focus_side=None,
+                                 skeleton_thickness=None):
     h, w = frame_bgr.shape[:2]
+    if skeleton_thickness is None:
+        skeleton_thickness = DRAW_THICKNESS
+    if skeleton_thickness <= 0:
+        return frame_bgr
+
     # keep skeleton thickness consistent across crop sizes
-    line_thickness = max(1, int(h * DRAW_THICKNESS / 540))
-    circle_radius  = max(1, int(h * 4 / 540))
+    line_thickness = max(1, int(h * skeleton_thickness / 540))
+    circle_radius  = max(1, int(h * (skeleton_thickness * 0.5) / 540))
     default_line_col = GRAY_BGR if focus_side in ('left', 'right') else (200, 200, 200)
 
     def _side_matches(jname):
@@ -563,6 +588,225 @@ def detect_steps(angle_df, fps=240.0, min_step_time=0.4, refine_radius=5):
              [(f, "right") for f in _peaks_for("right_hip")])
     steps.sort(key=lambda x: x[0])
     return steps
+
+
+def _mad(vals):
+    a = np.asarray(vals, dtype=float)
+    a = a[np.isfinite(a)]
+    if len(a) == 0:
+        return 0.0
+    med = np.median(a)
+    return float(np.median(np.abs(a - med)))
+
+
+def _bool_runs(mask):
+    runs = []
+    start = None
+    for i, v in enumerate(mask):
+        if v and start is None:
+            start = i
+        elif not v and start is not None:
+            runs.append((start, i - 1))
+            start = None
+    if start is not None:
+        runs.append((start, len(mask) - 1))
+    return runs
+
+
+def _peak_prominence_scores(vals, peaks):
+    scores = {}
+    if len(peaks) == 0:
+        return scores
+    for p in peaks:
+        l0 = max(0, p - 6)
+        r0 = min(len(vals), p + 7)
+        baseline = np.median(vals[l0:r0]) if r0 > l0 else vals[p]
+        scores[int(p)] = float(max(0.0, vals[p] - baseline))
+    return scores
+
+
+def detect_steps_robust(angle_df, depth_df=None, fps=240.0):
+    if angle_df is None or angle_df.empty:
+        return [], [], []
+    req = ('frame_num', 'left_hip', 'right_hip')
+    if any(c not in angle_df.columns for c in req):
+        return [], [], []
+
+    df = angle_df.copy()
+    frame_nums = df['frame_num'].to_numpy(dtype=int)
+    left_vals = df['left_hip'].ffill().bfill().to_numpy(dtype=float)
+    right_vals = df['right_hip'].ffill().bfill().to_numpy(dtype=float)
+    hip_mean = 0.5 * (left_vals + right_vals)
+    hip_diff = left_vals - right_vals
+
+    vel = np.abs(np.gradient(hip_mean))
+    jerk = np.abs(np.gradient(vel))
+
+    win = max(9, int(0.40 * fps))
+    if win % 2 == 0:
+        win += 1
+    amp = pd.Series(np.abs(hip_diff)).rolling(win, center=True, min_periods=max(5, win // 4)).std().to_numpy()
+    amp = np.nan_to_num(amp, nan=np.nanmedian(amp) if np.isfinite(np.nanmedian(amp)) else 0.0)
+
+    amp_med = float(np.median(amp))
+    amp_thr = max(float(np.percentile(amp, 20)), amp_med * 0.35)
+    low_amp = amp < amp_thr
+
+    vel_thr = float(np.median(vel) + 4.5 * max(_mad(vel), 1e-6))
+    jerk_thr = float(np.median(jerk) + 6.0 * max(_mad(jerk), 1e-6))
+    dyn_bad = (vel > vel_thr) | (jerk > jerk_thr)
+
+    turn_bad = np.zeros(len(df), dtype=bool)
+    if isinstance(depth_df, pd.DataFrame) and not depth_df.empty:
+        z_cols = ['joint_11', 'joint_12', 'joint_23', 'joint_24']
+        if all(c in depth_df.columns for c in z_cols) and 'frame_num' in depth_df.columns:
+            dep = depth_df[['frame_num'] + z_cols].dropna().copy()
+            if not dep.empty:
+                dep = dep.sort_values('frame_num')
+                yaw = 0.5 * ((dep['joint_11'] - dep['joint_12']) + (dep['joint_23'] - dep['joint_24']))
+                yaw = yaw.to_numpy(dtype=float)
+                yaw_frame = dep['frame_num'].to_numpy(dtype=int)
+                yaw_interp = np.interp(frame_nums, yaw_frame, yaw)
+                yaw_rate = np.abs(np.gradient(yaw_interp))
+                yr_thr = float(np.median(yaw_rate) + 5.0 * max(_mad(yaw_rate), 1e-6))
+                ymag = np.abs(yaw_interp)
+                ymag_thr = float(np.percentile(ymag, 25))
+                turn_bad = (yaw_rate > yr_thr) | (ymag < ymag_thr * 0.55)
+
+    bad = low_amp | dyn_bad | turn_bad
+
+    smooth_win = max(5, int(0.30 * fps))
+    if smooth_win % 2 == 0:
+        smooth_win += 1
+    smooth_bad = pd.Series(bad.astype(float)).rolling(smooth_win, center=True, min_periods=1).mean().to_numpy() > 0.45
+
+    min_excl_frames = max(8, int(0.25 * fps))
+    pad_frames = int(0.12 * fps)
+    exclusion_regions = []
+    for s, e in _bool_runs(smooth_bad):
+        if (e - s + 1) < min_excl_frames:
+            continue
+        s2 = max(0, s - pad_frames)
+        e2 = min(len(frame_nums) - 1, e + pad_frames)
+        exclusion_regions.append((int(frame_nums[s2]), int(frame_nums[e2])))
+
+    if len(exclusion_regions) > 1:
+        exclusion_regions.sort()
+        merged = [exclusion_regions[0]]
+        for s, e in exclusion_regions[1:]:
+            ps, pe = merged[-1]
+            if s <= pe + 1:
+                merged[-1] = (ps, max(pe, e))
+            else:
+                merged.append((s, e))
+        exclusion_regions = merged
+
+    good_mask = np.ones(len(frame_nums), dtype=bool)
+    for s, e in exclusion_regions:
+        good_mask &= ~((frame_nums >= s) & (frame_nums <= e))
+
+    seg_min = max(20, int(0.55 * fps))
+    good_segments = [(s, e) for s, e in _bool_runs(good_mask) if (e - s + 1) >= seg_min]
+
+    candidates = []
+    recovery_frames = int(0.50 * fps)
+    min_dist = max(10, int(0.30 * fps))
+
+    for s, e in good_segments:
+        seg_l = left_vals[s:e+1]
+        seg_r = right_vals[s:e+1]
+        p_l = max(1.0, 0.20 * float(np.std(seg_l)))
+        p_r = max(1.0, 0.20 * float(np.std(seg_r)))
+
+        peaks_l, _ = find_peaks(seg_l, distance=min_dist, prominence=p_l)
+        peaks_r, _ = find_peaks(seg_r, distance=min_dist, prominence=p_r)
+
+        # allow lighter thresholds right after a bad segment ends
+        rs = s
+        re = min(e, s + recovery_frames)
+        if re > rs + 4:
+            relax_l, _ = find_peaks(left_vals[rs:re+1], distance=max(8, int(min_dist * 0.8)), prominence=max(0.8, p_l * 0.7))
+            relax_r, _ = find_peaks(right_vals[rs:re+1], distance=max(8, int(min_dist * 0.8)), prominence=max(0.8, p_r * 0.7))
+            if len(relax_l):
+                peaks_l = np.unique(np.concatenate([peaks_l, relax_l + (rs - s)]))
+            if len(relax_r):
+                peaks_r = np.unique(np.concatenate([peaks_r, relax_r + (rs - s)]))
+
+        pl_scores = _peak_prominence_scores(seg_l, peaks_l)
+        pr_scores = _peak_prominence_scores(seg_r, peaks_r)
+
+        for p in peaks_l:
+            gidx = int(s + p)
+            candidates.append((gidx, 'left', pl_scores.get(int(p), 0.0)))
+        for p in peaks_r:
+            gidx = int(s + p)
+            candidates.append((gidx, 'right', pr_scores.get(int(p), 0.0)))
+
+    if not candidates:
+        return [], exclusion_regions, []
+
+    candidates.sort(key=lambda x: x[0])
+
+    # drop duplicate hits that are too close in time
+    deduped = [candidates[0]]
+    close_frames = int(0.20 * fps)
+    for c in candidates[1:]:
+        prev = deduped[-1]
+        if c[0] - prev[0] <= close_frames:
+            if c[2] > prev[2]:
+                deduped[-1] = c
+        else:
+            deduped.append(c)
+
+    # enforce left-right alternation and plausible step timing
+    accepted = []
+    min_step_frames = int(0.28 * fps)
+    max_step_frames = int(1.20 * fps)
+    for c in deduped:
+        if not accepted:
+            accepted.append(c)
+            continue
+        prev = accepted[-1]
+        dt = c[0] - prev[0]
+        if dt < min_step_frames:
+            if c[2] > prev[2]:
+                accepted[-1] = c
+            continue
+        if dt > max_step_frames:
+            accepted.append(c)
+            continue
+        if c[1] == prev[1]:
+            if c[2] > prev[2]:
+                accepted[-1] = c
+        else:
+            accepted.append(c)
+
+    if len(accepted) < 2:
+        return [], exclusion_regions, []
+
+    intervals = np.diff([a[0] for a in accepted])
+    med_int = float(np.median(intervals)) if len(intervals) else float(max(min_step_frames, 1))
+    if med_int <= 0:
+        med_int = float(max(min_step_frames, 1))
+
+    step_frames = []
+    step_meta = []
+    for i, (idx, side, prom) in enumerate(accepted):
+        fnum = int(frame_nums[idx])
+        q_prom = float(min(1.0, prom / (2.5 + 1e-6)))
+        if i == 0:
+            q_cad = 0.55
+        else:
+            dt = accepted[i][0] - accepted[i-1][0]
+            q_cad = float(max(0.0, 1.0 - abs(dt - med_int) / (0.7 * med_int + 1e-6)))
+        q_amp = float(min(1.0, max(0.0, amp[idx] / (amp_thr * 2.2 + 1e-6))))
+        q_total = float(0.45 * q_prom + 0.35 * q_cad + 0.20 * q_amp)
+        if q_total < 0.24:
+            continue
+        step_frames.append((fnum, side))
+        step_meta.append({'frame': fnum, 'side': side, 'quality': q_total})
+
+    return step_frames, exclusion_regions, step_meta
 
 
 def _get_cropped_dimensions(video_path, needs_rotation, crop_rect=None):
@@ -1172,9 +1416,12 @@ class GaitAnalysisDashboard(tk.Tk):
         self.show_normative       = True
         self.show_data            = True
         self.active_dataset_idx   = 0
+        ui_settings = _load_ui_settings()
+        self.skeleton_thickness = float(ui_settings.get('skeleton_thickness', DRAW_THICKNESS))
+        self.skeleton_thickness = max(0.0, min(float(DRAW_THICKNESS), self.skeleton_thickness))
         self.manual_step_mode     = True  # always active
         self.manual_side          = 'right'  # kept for older paths
-        self.show_suggestions     = True
+        self.show_suggestions     = False
         self.playing              = False
         self._marking_phase       = None   # none, left, or right
         self._marking_video_idx   = 0      # active video during markup
@@ -1453,7 +1700,7 @@ class GaitAnalysisDashboard(tk.Tk):
             ("Prev",         self._prev_frame),
             ("Next",         self._next_frame),
             ("Play",         self._toggle_play),
-            #("Auto steps",   self._recompute_steps),
+            ("Auto steps",   self._recompute_steps),
         ]
         for txt, cmd in buttons:
             tk.Button(bar, text=txt, command=cmd, **btn_cfg).pack(side='left', padx=2, pady=3)
@@ -1465,6 +1712,28 @@ class GaitAnalysisDashboard(tk.Tk):
         tk.Label(bar, textvariable=self._status_msg,
                  font=("Helvetica", 8), bg=BG2, fg=TEXT, anchor='w'
                  ).pack(side='left', padx=8)
+
+        # always-visible skeleton control in the lower right corner
+        self._skeleton_ctl = tk.Frame(self, bg=BG2, bd=1, relief='flat')
+        tk.Label(self._skeleton_ctl, text="Skeleton",
+                 font=("Helvetica", 8, "bold"), bg=BG2, fg=TEXT).pack(anchor='w', padx=6, pady=(3, 0))
+        self._skeleton_slider = tk.Scale(
+            self._skeleton_ctl,
+            from_=0,
+            to=DRAW_THICKNESS,
+            orient='horizontal',
+            resolution=0.5,
+            length=150,
+            bg=BG2,
+            fg=TEXT,
+            highlightthickness=0,
+            troughcolor=BG3,
+            command=self._on_skeleton_thickness_change,
+        )
+        self._skeleton_slider.set(self.skeleton_thickness)
+        self._skeleton_slider.pack(fill='x', padx=4, pady=(0, 2))
+        self._skeleton_ctl.place(relx=1.0, rely=1.0, x=-8, y=-8, anchor='se')
+        self._skeleton_ctl.lift()
 
     # video selection
     def find_videos(self):
@@ -1628,6 +1897,7 @@ class GaitAnalysisDashboard(tk.Tk):
             self.show_overlaid_cycles = False
             self.resample_cycles = False
             cached_loaded = self._resolve_cached_markup()
+            auto_excl_count = self._auto_exclude_bad_regions(overwrite=False)
             if self._start_required_markup_flow():
                 return
             self.show_overlaid_cycles = True
@@ -1635,7 +1905,9 @@ class GaitAnalysisDashboard(tk.Tk):
             self._update_display_btn_visuals()
             self.refresh()
             if cached_loaded:
-                self._status_msg.set("Loaded cached steps and exclusions")
+                self._status_msg.set("Loaded cached steps")
+            elif auto_excl_count:
+                self._status_msg.set(f"Loaded analysis with {auto_excl_count} auto exclusion zones")
             else:
                 self._status_msg.set("Loaded analysis")
 
@@ -1660,7 +1932,7 @@ class GaitAnalysisDashboard(tk.Tk):
         self.bind('m',              lambda e: self._toggle_mean())
         self.bind('v',              lambda e: self._cycle_graph_view())
         self.bind('t',              lambda e: self._toggle_active())
-        #self.bind('r',              lambda e: self._recompute_steps())
+        self.bind('r',              lambda e: self._recompute_steps())
         self.bind('g',              lambda e: self._toggle_suggestions())
         self.bind('d',              lambda e: self._clear_steps())
         self.bind('<space>',        lambda e: self._add_manual_step())
@@ -1703,11 +1975,7 @@ class GaitAnalysisDashboard(tk.Tk):
         cache_key = ds.get('_cache_key')
         if not cache_key:
             return
-        _save_cached_markup(
-            cache_key,
-            ds.get('step_frames', []),
-            ds.get('excluded_regions', []),
-        )
+        _save_cached_markup(cache_key, ds.get('step_frames', []))
 
     def _persist_all_dataset_markup(self):
         for ds in self.datasets:
@@ -1740,28 +2008,25 @@ class GaitAnalysisDashboard(tk.Tk):
                 continue
             cached_markup = ds.get('_cached_markup') or {}
             cached_steps = cached_markup.get('step_frames', [])
-            cached_exclusions = cached_markup.get('excluded_regions', [])
-            has_cached_markup = bool(cached_steps or cached_exclusions)
+            has_cached_markup = bool(cached_steps)
             if not has_cached_markup:
                 continue
 
             vid_name = self.video_names[i] if i < len(self.video_names) else f"Video {i+1}"
             answer = messagebox.askyesno(
-                "Cached markup found",
-                f"Cached steps or exclusions were found for {vid_name}.\n\n"
-                "Yes = load cached markup\n"
+                "Cached steps found",
+                f"Cached manual steps were found for {vid_name}.\n\n"
+                "Yes = load cached steps\n"
                 "No = overwrite and mark again",
                 parent=self,
             )
 
             if answer:
                 ds['step_frames'] = list(cached_steps)
-                ds['excluded_regions'] = list(cached_exclusions)
                 self._markup_required_videos[i] = False
                 cached_loaded = True
             else:
                 ds['step_frames'] = []
-                ds['excluded_regions'] = []
                 self._markup_required_videos[i] = True
                 cache_key = ds.get('_cache_key')
                 if cache_key:
@@ -1776,6 +2041,27 @@ class GaitAnalysisDashboard(tk.Tk):
                 self._enter_marking_phase(side, video_idx)
                 return True
         return False
+
+    def _auto_exclude_bad_regions(self, overwrite=False):
+        if not self.datasets:
+            return 0
+        total = 0
+        for ds in self.datasets:
+            if not ds:
+                continue
+            if not overwrite and ds.get('excluded_regions'):
+                total += len(ds.get('excluded_regions', []))
+                continue
+
+            ad = ds.get('angle_data', pd.DataFrame())
+            depths = ds.get('landmark_depths', pd.DataFrame())
+            _, auto_excl, _ = detect_steps_robust(ad, depth_df=depths, fps=SLOWMO_FPS)
+
+            ds['excluded_regions'] = self._merge_exclusion_regions(list(auto_excl))
+            ds['suggested_step_frames'] = []
+            ds['suggested_step_meta'] = []
+            total += len(ds.get('excluded_regions', []))
+        return total
 
     def _get_filtered_angle_data(self, angle_data, excluded_regions):
         if not excluded_regions or angle_data.empty:
@@ -1851,6 +2137,17 @@ class GaitAnalysisDashboard(tk.Tk):
             mapped.sort(key=lambda x: x[0])
             return mapped
 
+        def _shared_cycle_strikes(norm_steps):
+            left = [f for f, s in norm_steps if s == 'left']
+            right = [f for f, s in norm_steps if s == 'right']
+            if len(right) >= 2 and len(right) >= len(left):
+                return right
+            if len(left) >= 2:
+                return left
+            if len(right) >= 2:
+                return right
+            return []
+
         # find the longest usable cycle for overlaid mode
         max_cycle_length = self.resample_length
         if self.show_overlaid_cycles:
@@ -1861,20 +2158,17 @@ class GaitAnalysisDashboard(tk.Tk):
                 
                 sf = ds.get('step_frames', [])
                 norm = _to_fnums(ad_filtered, sf)
+                strikes = _shared_cycle_strikes(norm)
+                if len(strikes) < 2:
+                    continue
                 
-                for joint in JOINT_COLORS_MPL.keys():
-                    side = 'left' if joint.startswith('left_') else 'right'
-                    strikes = [f for f, s in norm if s == side]
-                    if len(strikes) < 2: continue
-                    
-                    for i in range(len(strikes)-1):
-                        # skip step pairs that cross excluded regions
-                        if self._region_crosses_exclusion(strikes[i], strikes[i+1], excluded):
-                            continue
-                            
-                        seg = ad_filtered[(ad_filtered['frame_num'] >= strikes[i]) & (ad_filtered['frame_num'] <= strikes[i+1])]
-                        if not seg.empty:
-                            max_cycle_length = max(max_cycle_length, len(seg))
+                for i in range(len(strikes)-1):
+                    # skip step pairs that cross excluded regions
+                    if self._region_crosses_exclusion(strikes[i], strikes[i+1], excluded):
+                        continue
+                    seg = ad_filtered[(ad_filtered['frame_num'] >= strikes[i]) & (ad_filtered['frame_num'] <= strikes[i+1])]
+                    if not seg.empty:
+                        max_cycle_length = max(max_cycle_length, len(seg))
         self._current_max_cycle_length = max_cycle_length
 
         if not self.show_overlaid_cycles:
@@ -1890,6 +2184,9 @@ class GaitAnalysisDashboard(tk.Tk):
                 sf  = ds.get('step_frames', [])
                 si  = _src_idx(ds)
                 ls  = linestyles[si % 2]
+
+                for start_frame, end_frame in excluded:
+                    ax.axvspan(start_frame, end_frame, alpha=0.10, color='darkgray', zorder=1)
 
                 # build an exclusion mask for this dataset
                 frames = ad['frame_num'].values
@@ -1976,17 +2273,16 @@ class GaitAnalysisDashboard(tk.Tk):
                 si   = _src_idx(ds)
                 ls   = linestyles[si % 2]
                 norm = _to_fnums(ad_filtered, sf)
+                strikes = _shared_cycle_strikes(norm)
+                if len(strikes) < 2:
+                    continue
 
                 for joint, col in JOINT_COLORS_MPL.items():
                     vis = self.joint_visibility.get(joint, True)
                     if not vis:
                         continue
-                    side    = 'left' if joint.startswith('left_') else 'right'
-                    strikes = [f for f, s in norm if s == side]
-                    if len(strikes) < 2: continue
 
                     cycles, lengths = [], []
-                    excluded = ds.get('excluded_regions', [])
                     
                     for i in range(len(strikes)-1):
                         # skip step pairs that cross excluded regions
@@ -2038,12 +2334,6 @@ class GaitAnalysisDashboard(tk.Tk):
                         ax.fill_between(norm_x_resampled, d['lower'], d['upper'],
                                         color=C_NORM, alpha=0.12,
                                         label=f'{jt_key.title()} norm.')
-        # shade excluded regions
-        for ds in dfg:
-            excluded = ds.get('excluded_regions', [])
-            for start_frame, end_frame in excluded:
-                ax.axvspan(start_frame, end_frame, alpha=0.05, color='darkgray', zorder=1)
-
         # set x limits after plotting to avoid autoscaling drift
         if self.show_overlaid_cycles:
             # overlaid cycles use the longest actual stride
@@ -2088,7 +2378,12 @@ class GaitAnalysisDashboard(tk.Tk):
             # draw the skeleton at render time using current joint visibility
             if pixel_lm is not None:
                 frame = frame.copy()
-                draw_pose_landmarks_on_frame(frame, pixel_lm, self.joint_visibility)
+                draw_pose_landmarks_on_frame(
+                    frame,
+                    pixel_lm,
+                    self.joint_visibility,
+                    skeleton_thickness=self.skeleton_thickness,
+                )
 
             # rotate the analysis frame so the person appears upright in the gui
             frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
@@ -2628,6 +2923,17 @@ class GaitAnalysisDashboard(tk.Tk):
         self._show_video_frames()
         self.redraw_graph()
 
+    def _on_skeleton_thickness_change(self, value):
+        try:
+            self.skeleton_thickness = max(0.0, min(float(DRAW_THICKNESS), float(value)))
+        except Exception:
+            return
+        _save_ui_settings({'skeleton_thickness': self.skeleton_thickness})
+        if self._marking_phase:
+            self._markup_show_frames()
+        else:
+            self._show_video_frames()
+
     def _toggle_display_option(self, key):
         if key == 'mean':
             if not self.show_overlaid_cycles:
@@ -2746,15 +3052,21 @@ class GaitAnalysisDashboard(tk.Tk):
         if not self.datasets: 
             return
         total_steps = 0
+        total_excl = 0
         for ds in self.datasets:
             if ds and 'angle_data' in ds:
-                # detect steps from data with exclusions removed
-                excluded = ds.get('excluded_regions', [])
-                filtered_ad = self._get_filtered_angle_data(ds['angle_data'], excluded)
-                ds['suggested_step_frames'] = detect_steps(
-                    filtered_ad, fps=SLOWMO_FPS)
+                ad = ds.get('angle_data', pd.DataFrame())
+                depths = ds.get('landmark_depths', pd.DataFrame())
+                suggested, auto_excl, step_meta = detect_steps_robust(
+                    ad, depth_df=depths, fps=SLOWMO_FPS)
+                ds['suggested_step_frames'] = suggested
+                ds['suggested_step_meta'] = step_meta
+                ds['excluded_regions'] = self._merge_exclusion_regions(list(auto_excl))
+                self._persist_dataset_markup(ds)
                 total_steps += len(ds.get('suggested_step_frames', []))
-        self._status_msg.set(f"Auto steps: {total_steps} suggestions generated across all videos")
+                total_excl += len(ds.get('excluded_regions', []))
+        self._status_msg.set(
+            f"Auto clean complete: {total_steps} step suggestions, {total_excl} exclusion zones")
         self._update_metrics_panel()
         self.redraw_graph()
 
@@ -2965,6 +3277,8 @@ class GaitAnalysisDashboard(tk.Tk):
         self._main_content.pack_forget()
         self._bottom_bar.pack_forget()
         self._markup_frame.pack(fill='both', expand=True)
+        if hasattr(self, '_skeleton_ctl'):
+            self._skeleton_ctl.lift()
         self._status_msg.set(
             f"Mark every {noun} foot strike with SPACE — Video {vid_num}")
         # wait briefly so tkinter can resolve widget geometry
@@ -2976,6 +3290,8 @@ class GaitAnalysisDashboard(tk.Tk):
         self._markup_frame.pack_forget()
         self._bottom_bar.pack(fill='x', side='bottom')
         self._main_content.pack(fill='both', expand=True, padx=8, pady=(4, 0))
+        if hasattr(self, '_skeleton_ctl'):
+            self._skeleton_ctl.lift()
         self._persist_all_dataset_markup()
 
         # switch into overlaid cycles when markup is complete
@@ -3013,7 +3329,8 @@ class GaitAnalysisDashboard(tk.Tk):
         if pixel_lm is not None:
             frame = frame.copy()
             draw_pose_landmarks_on_frame(frame, pixel_lm, self.joint_visibility,
-                                         focus_side=self._marking_phase)
+                                         focus_side=self._marking_phase,
+                                         skeleton_thickness=self.skeleton_thickness)
 
         frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -3045,12 +3362,29 @@ class GaitAnalysisDashboard(tk.Tk):
             return
 
         frames = ad['frame_num'].values
+        excluded = ds.get('excluded_regions', [])
+
+        excl_mask = np.zeros(len(frames), dtype=bool)
+        for start_frame, end_frame in excluded:
+            excl_mask |= (frames >= start_frame) & (frames < end_frame)
+
+        # shade excluded windows to match the main graph behavior
+        for start_frame, end_frame in excluded:
+            ax.axvspan(start_frame, end_frame, alpha=0.18, color='#6e6e6e', zorder=1)
+
         for joint, col in JOINT_COLORS_MPL.items():
             if joint not in ad.columns:
                 continue
             if not self.joint_visibility.get(joint, True):
                 continue
-            ax.plot(frames, ad[joint].values, color=col, lw=1.0, alpha=0.8)
+            vals = ad[joint].values.astype(float)
+            if excluded:
+                gray_vals = vals.copy()
+                gray_vals[~excl_mask] = np.nan
+                ax.plot(frames, gray_vals, color='#7a7a7a', lw=1.2, alpha=0.9, zorder=2)
+            clean_vals = vals.copy()
+            clean_vals[excl_mask] = np.nan
+            ax.plot(frames, clean_vals, color=col, lw=1.0, alpha=0.85, zorder=3)
 
         # draw the confirmed step markers for the current side
         side = self._marking_phase
