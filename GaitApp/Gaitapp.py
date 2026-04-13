@@ -2663,7 +2663,7 @@ class GaitAnalysisDashboard(tk.Tk):
         if self.show_overlaid_cycles:
             self._sidebar_toggle_btns['cycles'].config(text="Continuous", bg=ACCENT, fg='white')
         else:
-            self._sidebar_toggle_btns['cycles'].config(text="Cycles", bg=BG3, fg=TEXT)
+            self._sidebar_toggle_btns['cycles'].config(text="Cycles", bg=ACCENT, fg='white')
 
         if USE_WORLD_LANDMARKS:
             self._sidebar_toggle_btns['world_px'].config(text="Pixel", bg=ACCENT, fg='white')
