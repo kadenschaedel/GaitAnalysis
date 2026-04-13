@@ -1,4 +1,4 @@
-# imports
+# standard imports
 import atexit
 import gc
 import os
@@ -36,17 +36,17 @@ def resource_path(filename):
     base = sys._MEIPASS if getattr(sys, 'frozen', False) else os.path.dirname(os.path.abspath(__file__))
     return os.path.join(base, filename)
 
-# settings
+# analysis settings
 SLOWMO_FPS    = 240
 FILTER_CUTOFF = 6
 FILTER_ORDER  = 4
 
-# memory / disk
+# frame storage settings
 SAVE_HEIGHT  = 540
 JPEG_QUALITY = 65
 CACHE_FRAMES = 96
 
-# model path
+# pose model path
 MODEL_PATH = resource_path("pose_landmarker_full.task")
 MODEL_URL  = ("https://storage.googleapis.com/mediapipe-models/"
               "pose_landmarker/pose_landmarker_full/float16/1/"
@@ -59,7 +59,7 @@ def ensure_model():
         print("Download complete.")
 
 
-# landmark indices
+# pose landmark indices
 class PoseLandmark:
     NOSE = 0
     LEFT_EYE_INNER = 1;  LEFT_EYE = 2;   LEFT_EYE_OUTER = 3
@@ -84,14 +84,14 @@ POSE_CONNECTIONS = [
     (11,12),(11,13),(13,15),(15,17),(15,19),(15,21),(17,19),   # left arm
     (12,14),(14,16),(16,18),(16,20),(16,22),(18,20),           # right arm
     (11,23),(12,24),(23,24),                                    # torso
-    (23,25),(24,26),(25,27),(26,28),                            # upper legs
-    (27,29),(28,30),(29,31),(30,32),(27,31),(28,32),           # lower legs / feet
+    (23,25),(24,26),(25,27),(26,28),                            # upper leg
+    (27,29),(28,30),(29,31),(30,32),(27,31),(28,32),           # lower leg and foot
 ]
 
-# skeleton
+# skeleton display settings
 DRAW_THICKNESS      = 8
 USE_WORLD_LANDMARKS = True
-SKELETON_LINE_COL   = (0, 0, 255)   # cyan lines
+SKELETON_LINE_COL   = (0, 0, 255)   # cyan line
 
 JOINT_NAME_TO_LANDMARK = {
     'left_hip':    PoseLandmark.LEFT_HIP,
@@ -102,7 +102,7 @@ JOINT_NAME_TO_LANDMARK = {
     'right_ankle': PoseLandmark.RIGHT_ANKLE,
 }
 
-# reverse mapping: landmark index -> joint name
+# reverse lookup from landmark index to joint name
 LANDMARK_TO_JOINT_NAME = {v: k for k, v in JOINT_NAME_TO_LANDMARK.items()}
 
 # joint colors
@@ -112,34 +112,33 @@ JOINT_COLORS_MPL = {
 }
 
 def hex_to_bgr(hex_color):
-    """Convert hex color string to BGR tuple for OpenCV."""
     hex_color = hex_color.lstrip('#')
     r, g, b = tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
-    return (b, g, r)  # OpenCV uses BGR, not RGB
+    return (b, g, r)  # opencv uses bgr, not rgb
 
-# Convert MPL colors to BGR for skeleton drawing
+# convert mpl colors for opencv drawing
 JOINT_COLORS_BGR = {k: hex_to_bgr(v) for k, v in JOINT_COLORS_MPL.items()}
 C_RIGHT = '#4a90d9'   # right step marker
 C_LEFT  = '#e8913a'   # left step marker
 
 # ui colors
 BG      = "#f0f0f0"   # window background
-BG2     = "#d6d6d6"   # header / panels
-BG3     = "#c8c8c8"   # cards / toolbar
+BG2     = "#d6d6d6"   # header and panels
+BG3     = "#c8c8c8"   # cards and toolbar
 BG_VID  = "#d8d8d8"   # video canvas
 BG_PLOT = "#b8b8b8"   # graph axes
 BG_INIT = "#c0c0c0"   # graph before data
 
 # text colors
-ACCENT  = "#3a083a"   # purple (logo, headers)
+ACCENT  = "#3a083a"   # logo and header accent
 TEXT    = "#1a1a1a"
 SUBTEXT = "#4a4a4a"
 GREEN   = '#27ae60'
 RED     = '#c0392b'
 
 # label colors
-C_V1      = "#4a1a44"   # video 1 (purple tint)
-C_V2      = "#2e6b40"   # video 2 (green tint)
+C_V1      = "#4a1a44"   # video 1 tint
+C_V2      = "#2e6b40"   # video 2 tint
 C_CURSOR  = '#ff4444'   # playhead line
 C_OUTLIER = '#555555'   # outlier cycle
 C_NORM    = '#888888'   # normative band
@@ -204,14 +203,13 @@ SimpleLandmark = namedtuple('SimpleLandmark', ['x', 'y', 'visibility'])
 
 GRAY_BGR = (128, 128, 128)
 
-# analysis functions
+# drawing and analysis helpers
 def draw_pose_landmarks_on_frame(frame_bgr, pixel_landmarks, joint_visibility=None):
     h, w = frame_bgr.shape[:2]
-    # Scale skeleton thickness relative to frame height so it looks the same
-    # regardless of resolution/crop differences between videos
+    # keep skeleton thickness consistent across crop sizes
     line_thickness = max(1, int(h * DRAW_THICKNESS / 540))
     circle_radius  = max(1, int(h * 4 / 540))
-    default_line_col = (200, 200, 200)  # light gray for non-tracked joints
+    default_line_col = (200, 200, 200)  # fallback color for non tracked joints
     
     def _resolve_color(landmark_idx, base_color):
         if landmark_idx not in LANDMARK_TO_JOINT_NAME:
@@ -221,12 +219,12 @@ def draw_pose_landmarks_on_frame(frame_bgr, pixel_landmarks, joint_visibility=No
             return GRAY_BGR
         return JOINT_COLORS_BGR[jname]
 
-    # Draw lines connecting landmarks
+    # draw limb connections
     for s, e in POSE_CONNECTIONS:
         if s < len(pixel_landmarks) and e < len(pixel_landmarks):
             ls, le = pixel_landmarks[s], pixel_landmarks[e]
             if ls.visibility > 0.5 and le.visibility > 0.5:
-                # Use color of end joint if tracked, otherwise try start
+                # prefer the tracked joint color when available
                 if e in LANDMARK_TO_JOINT_NAME:
                     line_color = _resolve_color(e, default_line_col)
                 elif s in LANDMARK_TO_JOINT_NAME:
@@ -239,13 +237,13 @@ def draw_pose_landmarks_on_frame(frame_bgr, pixel_landmarks, joint_visibility=No
                          (int(le.x*w), int(le.y*h)),
                          line_color, line_thickness)
     
-    # Draw joint circles with colors
+    # draw landmark circles
     for idx, lm in enumerate(pixel_landmarks):
         if lm.visibility > 0.5:
             if idx in LANDMARK_TO_JOINT_NAME:
                 joint_color = _resolve_color(idx, (255, 0, 255))
             else:
-                joint_color = (255, 0, 255)  # magenta for non-tracked joints
+                joint_color = (255, 0, 255)  # magenta for non tracked joints
             
             cv2.circle(frame_bgr, (int(lm.x*w), int(lm.y*h)), circle_radius, joint_color, -1)
     
@@ -272,7 +270,7 @@ def determine_walking_direction(landmarks):
 
 
 def calculate_angle(a, b, c, d=None, direction="left", joint_type="hip"):
-    # calculate angle
+    # calculate the joint angle
     a = np.array(a[:2])
     b = np.array(b[:2])
     c = np.array(c[:2])
@@ -298,15 +296,15 @@ def calculate_angle(a, b, c, d=None, direction="left", joint_type="hip"):
     return angle
 
 
-def detect_crop_region(video_path, needs_rotation, sample_count=5):
+def detect_crop_region(video_path, needs_rotation, sample_count=10):
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         return None
 
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    sample_count = min(sample_count, total)
+    sample_count = min(sample_count, max(1, total))
 
-    # Accumulate the union of non-black regions across samples
+    # collect the union of non black regions across samples
     x_min, y_min = float('inf'), float('inf')
     x_max, y_max = 0, 0
     full_h, full_w = 0, 0
@@ -321,8 +319,10 @@ def detect_crop_region(video_path, needs_rotation, sample_count=5):
             frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
         full_h, full_w = frame.shape[:2]
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        # Threshold: anything above 10 is considered content
-        _, thresh = cv2.threshold(gray, 10, 255, cv2.THRESH_BINARY)
+        # blur first to reduce border compression noise
+        gray = cv2.GaussianBlur(gray, (5, 5), 0)
+        # threshold slightly above black to catch border noise
+        _, thresh = cv2.threshold(gray, 20, 255, cv2.THRESH_BINARY)
         coords = cv2.findNonZero(thresh)
         if coords is None:
             continue
@@ -340,17 +340,22 @@ def detect_crop_region(video_path, needs_rotation, sample_count=5):
     cw = x_max - x_min
     ch = y_max - y_min
 
-    # Only crop if the borders are meaningful (>2% of frame on any side)
+    # convert each border width to a frame fraction
     margin = 0.02
-    if (x_min < full_w * margin and y_min < full_h * margin and
-            cw > full_w * (1 - 2 * margin) and ch > full_h * (1 - 2 * margin)):
-        return None  # negligible borders
+    left_frac   = x_min / full_w
+    top_frac    = y_min / full_h
+    right_frac  = (full_w - x_max) / full_w
+    bottom_frac = (full_h - y_max) / full_h
+
+    # skip cropping when borders are negligible
+    if max(left_frac, top_frac, right_frac, bottom_frac) < margin:
+        return None  # borders are too small to crop
 
     return (x_min, y_min, cw, ch)
 
 
 def butter_lowpass_filter(data, cutoff=4.0, fs=240.0, order=4):
-    # butterworth filter
+    # apply a butterworth low pass filter
     nyq  = 0.5 * fs
     b, a = butter(order, cutoff/nyq, btype='low', analog=False)
     return filtfilt(b, a, data)
@@ -378,9 +383,7 @@ def detect_steps(angle_df, fps=240.0, min_step_time=0.4, refine_radius=5):
         if cand.size == 0:
             return []
 
-        # adaptive outlier removal: reject peaks whose interval to the
-        # previous accepted peak is less than 50% of the median inter-peak
-        # interval.  this eliminates noise blips without cascading rejection.
+        # reject peaks that arrive much too soon after the last accepted peak
         if len(cand) >= 3:
             med_interval = np.median(np.diff(cand))
             filtered = [cand[0]]
@@ -397,6 +400,28 @@ def detect_steps(angle_df, fps=240.0, min_step_time=0.4, refine_radius=5):
     return steps
 
 
+def _get_cropped_dimensions(video_path, needs_rotation):
+    crop_rect = detect_crop_region(video_path, needs_rotation)
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return None
+    
+    ret, frame = cap.read()
+    cap.release()
+    if not ret:
+        return None
+    
+    if needs_rotation:
+        frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    
+    if crop_rect:
+        cx, cy, cw_r, ch_r = crop_rect
+        return (cw_r, ch_r)
+    else:
+        h, w = frame.shape[:2]
+        return (w, h)
+
+
 def select_video_paths():
     root = tk.Tk()
     root.withdraw()
@@ -407,7 +432,7 @@ def select_video_paths():
     return list(paths)
 
 
-# joint definitions
+# joint angle definitions
 JOINT_DEFS = {
     'left_hip':    (None,                        PoseLandmark.LEFT_HIP,    PoseLandmark.LEFT_KNEE),
     'right_hip':   (None,                        PoseLandmark.RIGHT_HIP,   PoseLandmark.RIGHT_KNEE),
@@ -436,7 +461,7 @@ def _log_direction_diagnostics(df_w, df_p, video_path, detected_rotation):
             continue
         
         directions = df['_direction'].values
-        # smooth directions
+        # smooth the direction labels before summarizing them
         smoothed = directions.copy()
         window = 30
         for i in range(len(smoothed)):
@@ -477,7 +502,7 @@ def _log_direction_diagnostics(df_w, df_p, video_path, detected_rotation):
                 'offset_left_minus_right': float(np.nanmean(left_vals) - np.nanmean(right_vals)) if len(left_vals) > 0 and len(right_vals) > 0 else None,
             }
             
-            # add peak/trough analysis per direction using scipy
+            # summarize peaks and troughs for each walking direction
             for dir_label, dir_vals in [('left', left_vals), ('right', right_vals)]:
                 if len(dir_vals) > 20:
                     peaks, _ = find_peaks(dir_vals, distance=40, prominence=1.0)
@@ -496,13 +521,13 @@ def _log_direction_diagnostics(df_w, df_p, video_path, detected_rotation):
             
             rows.append(row)
     
-    # also log raw per-frame data to a second csv
+    # save raw per frame values to a second csv
     raw_path = os.path.join(output_dir, f'raw_angles_{vid_name}_{timestamp}.csv')
     df_raw = df_w.copy()
     df_raw['_smoothed_direction'] = smoothed if '_direction' in df_w.columns else 'unknown'
     df_raw.to_csv(raw_path, index=False)
     
-    # write summary csv
+    # write the summary csv
     if rows:
         fieldnames = rows[0].keys()
         with open(output_path, 'w', newline='') as f:
@@ -523,7 +548,7 @@ def _detect_subject_orientation(video_path):
     fps   = cap.get(cv2.CAP_PROP_FPS) or 30
     sample_count = min(10, total)
 
-    # Create a throwaway IMAGE-mode landmarker for probing
+    # use a temporary image mode landmarker for orientation checks
     base_opts = mp_python.BaseOptions(model_asset_path=MODEL_PATH)
     opts = PoseLandmarkerOptions(
         base_options=base_opts, running_mode=RunningMode.IMAGE,
@@ -554,7 +579,7 @@ def _detect_subject_orientation(video_path):
         lh = lm[PoseLandmark.LEFT_HIP]
         rh = lm[PoseLandmark.RIGHT_HIP]
 
-        # shoulder midpoint to hip midpoint
+        # compare shoulder and hip midpoint offsets
         sx = (ls.x + rs.x) / 2
         sy = (ls.y + rs.y) / 2
         hx = (lh.x + rh.x) / 2
@@ -565,19 +590,19 @@ def _detect_subject_orientation(video_path):
 
         detections += 1
         if dy > dx:
-            vertical_votes += 1  # person is upright
+            vertical_votes += 1  # person appears upright
 
     cap.release()
     landmarker.close()
 
     if detections == 0:
-        return False  # can't tell — don't rotate
+        return False  # leave the frame as is if orientation is unclear
 
-    # majority vote
+    # use a simple majority vote across sampled frames
     return vertical_votes > detections / 2
 
 
-def process_video(video_path, ann_dir, progress_cb, status_cb):
+def process_video(video_path, ann_dir, progress_cb, status_cb, target_output_size=None):
     status_cb("Detecting subject orientation…")
     needs_rotation = _detect_subject_orientation(video_path)
     if needs_rotation:
@@ -585,11 +610,21 @@ def process_video(video_path, ann_dir, progress_cb, status_cb):
     else:
         status_cb("Subject is sideways — no rotation needed")
 
-    # Detect black borders to crop out
+    # detect black borders for cropping
     crop_rect = detect_crop_region(video_path, needs_rotation)
+    
+    # calculate the cropped frame size
+    cropped_size = None
     if crop_rect:
         cx, cy, cw_r, ch_r = crop_rect
+        cropped_size = (cw_r, ch_r)
         status_cb(f"Cropping black borders: {cx},{cy} {cw_r}x{ch_r}")
+    else:
+        status_cb("No significant black borders detected")
+    
+    # default the target size to the cropped size
+    if target_output_size is None and cropped_size:
+        target_output_size = cropped_size
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -616,14 +651,31 @@ def process_video(video_path, ann_dir, progress_cb, status_cb):
         frame_count += 1
         progress_cb(frame_count / max(1, total))
 
-        # Rotate frames 90° CCW if the subject was detected as upright
+        # rotate upright captures into the expected analysis orientation
         if needs_rotation:
             frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
 
-        # Crop out black borders
+        # remove detected black borders
         if crop_rect:
             cx, cy, cw_r, ch_r = crop_rect
             frame = frame[cy:cy+ch_r, cx:cx+cw_r]
+
+        # keep an unpadded frame copy for the viewer
+        view_frame = frame
+
+        # pad to a shared output size so landmarks stay comparable
+        pad_left, pad_top = 0, 0
+        pad_fw, pad_fh = frame.shape[1], frame.shape[0]
+        if target_output_size:
+            h, w = frame.shape[:2]
+            target_w, target_h = target_output_size
+            if w != target_w or h != target_h:
+                pad_top  = (target_h - h) // 2
+                pad_left = (target_w - w) // 2
+                canvas = np.zeros((target_h, target_w, frame.shape[2]), dtype=frame.dtype)
+                canvas[pad_top:pad_top+h, pad_left:pad_left+w] = frame
+                frame = canvas
+                pad_fw, pad_fh = target_w, target_h
 
         rgb    = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
@@ -635,15 +687,24 @@ def process_video(video_path, ann_dir, progress_cb, status_cb):
             world_lm = (result.pose_world_landmarks[0]
                         if result.pose_world_landmarks else pixel_lm)
 
-            # Save raw frame (skeleton drawn at render time for dynamic visibility)
-            raw = frame.copy()
+            # save the clean frame so the viewer has no black bars
+            raw = view_frame.copy()
             h, w = raw.shape[:2]
             if SAVE_HEIGHT and h > SAVE_HEIGHT:
                 nw = int(w * SAVE_HEIGHT / h)
                 raw = cv2.resize(raw, (nw, SAVE_HEIGHT), interpolation=cv2.INTER_AREA)
             raw_path = os.path.join(ann_dir, f"raw_{frame_count:06d}.jpg")
             cv2.imwrite(raw_path, raw, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
-            landmarks.append((raw_path, [SimpleLandmark(lm.x, lm.y, lm.visibility) for lm in pixel_lm]))
+
+            # map padded landmark coordinates back into view frame space
+            view_w, view_h = view_frame.shape[1], view_frame.shape[0]
+            def _remap_lm(lm, _pl=pad_left, _pt=pad_top, _pfw=pad_fw, _pfh=pad_fh,
+                          _vw=view_w, _vh=view_h):
+                nx = (lm.x * _pfw - _pl) / _vw if _vw > 0 else lm.x
+                ny = (lm.y * _pfh - _pt) / _vh if _vh > 0 else lm.y
+                return SimpleLandmark(nx, ny, lm.visibility)
+            remapped_pixel_lm = [_remap_lm(lm) for lm in pixel_lm]
+            landmarks.append((raw_path, remapped_pixel_lm))
 
             direction = determine_walking_direction(pixel_lm)
             w_row = {'frame_num': frame_count, '_direction': direction}
@@ -689,7 +750,7 @@ def process_video(video_path, ann_dir, progress_cb, status_cb):
                 w_row[name] = calculate_angle(aw, bw, cw, dw, direction, jt)
                 p_row[name] = calculate_angle(ap, bp, cp, dp, direction, jt)
 
-            # Capture landmark depths (z-coordinates from world landmarks)
+            # keep world landmark depth values for later analysis
             depth_row = {'frame_num': frame_count}
             for i, landmark in enumerate(world_lm):
                 depth_row[f'joint_{i}'] = landmark.z
@@ -708,7 +769,7 @@ def process_video(video_path, ann_dir, progress_cb, status_cb):
     df_p = pd.DataFrame(pixel_rows)
     df_depths = pd.DataFrame([d for d in landmark_depths if d is not None])
 
-    # Log raw diagnostics BEFORE correction
+    # save diagnostics before any later corrections
     try:
         diag_path, raw_path = _log_direction_diagnostics(df_w, df_p, video_path, 0)
         status_cb(f"Diagnostics saved: {os.path.basename(diag_path)}")
@@ -721,13 +782,13 @@ def process_video(video_path, ann_dir, progress_cb, status_cb):
                 df[col] = butter_lowpass_filter(df[col], FILTER_CUTOFF, SLOWMO_FPS, FILTER_ORDER)
                 df[col] = df[col].astype(np.float32)
 
-    # Drop the helper column before further use
+    # drop the helper direction column before returning data
     for df in (df_w, df_p):
         if '_direction' in df.columns:
             df.drop('_direction', axis=1, inplace=True)
 
     ad    = df_w if USE_WORLD_LANDMARKS else df_p
-    suggested_steps = detect_steps(ad, fps=SLOWMO_FPS)
+    # suggested_steps = detect_steps(ad, fps=SLOWMO_FPS)
     del world_rows, pixel_rows
     gc.collect()
 
@@ -736,9 +797,9 @@ def process_video(video_path, ann_dir, progress_cb, status_cb):
         'df_pixel':       df_p,
         'angle_data':     ad,
         'step_frames':    [],
-        'suggested_step_frames': suggested_steps,
+        # 'suggested_step_frames': suggested_steps,
         'excluded_regions': [],
-        'all_landmarks':  landmarks,   # list of (raw_path, pixel_landmarks) tuples
+        'all_landmarks':  landmarks,   # each item stores a raw path and pixel landmarks
         'landmark_depths': df_depths,
         'needs_rotation': needs_rotation,
     }
@@ -834,7 +895,7 @@ class FrameCache:
             return None
         p = store[frame_idx]
         if p is None: return None
-        # Handle new (raw_path, pixel_landmarks) tuple format
+        # support raw path plus pixel landmark tuples
         path = p[0] if isinstance(p, tuple) else p
         img = cv2.imread(path) if isinstance(path, str) else path
         if img is not None:
@@ -869,7 +930,7 @@ HELP_TEXT = [
     ("Step Editing",  None),
     ("Space",         "Add manual step at current frame (auto-detects foot)"),
     ("Backspace/Del", "Remove nearest manual step"),
-    ("r",             "Generate step suggestions (all videos)"),
+    #("r",             "Generate step suggestions (all videos)"),
     ("g",             "Toggle visibility of suggested steps"),
     ("d",             "Clear manual steps (all videos)"),
     ("",              None),
@@ -888,7 +949,7 @@ class GaitAnalysisDashboard(tk.Tk):
         self.title("Gait Analysis")
         self.geometry("1400x860")
 
-        # state
+        # ui state
         self.datasets           = []
         self.video_names        = ["Video 1", "Video 2"]
         self.current_frame_idx  = 0
@@ -907,15 +968,18 @@ class GaitAnalysisDashboard(tk.Tk):
         self.show_overlaid_cycles = False
         self.resample_cycles      = False
         self.resample_length      = 100
-        self.show_mean            = False
+        self.show_mean            = True
         self.mean_only            = False
         self.show_normative       = True
         self.show_data            = True
         self.active_dataset_idx   = 0
-        self.manual_step_mode     = True  # Always active - no toggle needed
-        self.manual_side          = 'right'  # Deprecated - auto-detected from suggested steps
+        self.manual_step_mode     = True  # always active
+        self.manual_side          = 'right'  # kept for older paths
         self.show_suggestions     = True
         self.playing              = False
+        self._marking_phase       = None   # none, left, or right
+        self._marking_video_idx   = 0      # active video during markup
+        self._markup_frame        = None   # created on first use
         self._play_after_id       = None
         self._graph_dragging      = False
         self._exclusion_selecting = False
@@ -949,11 +1013,6 @@ class GaitAnalysisDashboard(tk.Tk):
                  font=("Coiny Cyrillic", 17), bg=BG2, fg=ACCENT,
                  ).pack(side='left', pady=(6, 0))
 
-        tk.Button(hdr, text="? Help", font=("Helvetica", 9),
-                  bg=BG3, fg=TEXT, relief='flat', padx=8,
-                  command=self._show_help
-                  ).pack(side='right', padx=10, pady=8)
-
         tk.Button(hdr, text="Select", font=("Helvetica", 9),
                   bg=BG3, fg=TEXT, relief='flat', padx=8,
                   command=self.find_videos
@@ -967,31 +1026,36 @@ class GaitAnalysisDashboard(tk.Tk):
         self._v1_lbl.pack(side='right', padx=18)
 
 
-        # main layout: graph+videos left, metrics right
+        # main layout with graph and videos on the left
         main = tk.Frame(self, bg=BG)
         main.pack(fill='both', expand=True, padx=8, pady=(4, 0))
+        self._main_content = main
 
         left = tk.Frame(main, bg=BG)
         left.pack(side='left', fill='both', expand=True)
 
-        # graph row: graph on left, interactive legend on right
+        # graph row with the legend docked on the right
         graph_row = tk.Frame(left, bg=BG2)
         graph_row.pack(fill='x')
 
         gf = tk.Frame(graph_row, bg=BG2)
         gf.pack(side='left', fill='both', expand=True)
 
-        # add h-scrollbar below the canvas
+        # add a horizontal scrollbar under the graph
         self._graph_hbar = tk.Scrollbar(gf, orient='horizontal', command=self._on_scrollbar_drag)
         self._graph_hbar.pack(fill='x', side='bottom')
 
         self._fig, self._ax = plt.subplots(figsize=(11, 4.2), dpi=100)
-        self._ax_xlim_full = None # set after data loads
-        self._ax_xlim_per_mode = {}  # Track zoom limits per graph mode
+        self._ax_xlim_full = None # filled after data loads
+        self._ax_xlim_per_mode = {}  # keep zoom limits per graph mode
         self._zoom_level = 1.0
-        self._last_scroll_event = None  # Store for zoom on cursor position
+        self._last_scroll_event = None  # keep the last wheel event for cursor zoom
         self._fig.patch.set_facecolor(BG)
         self._ax.set_facecolor(BG_INIT)
+        # match the startup styling to redraw_graph
+        for spine in self._ax.spines.values():
+            spine.set_color(BG2)
+        self._ax.tick_params(colors=SUBTEXT, labelsize=9)
         self._mpl_canvas = FigureCanvasTkAgg(self._fig, master=gf)
         self._mpl_canvas.get_tk_widget().pack(fill='x')
         self._mpl_canvas.mpl_connect('button_press_event',   self._on_graph_click)
@@ -1003,11 +1067,14 @@ class GaitAnalysisDashboard(tk.Tk):
         self._legend_frame.pack(side='right', fill='y', padx=(2, 0))
         self._legend_frame.pack_propagate(False)
 
-        # v1/v2 toggle buttons at top
+        self._legend_bottom = tk.Frame(self._legend_frame, bg=BG2)
+        self._legend_bottom.pack(side='bottom', fill='x', padx=4, pady=(4, 8))
+
+        # v1 and v2 toggle buttons
         ind_frame = tk.Frame(self._legend_frame, bg=BG2)
         ind_frame.pack(fill='x', padx=6, pady=(8, 2))
 
-        # V1 button with dashed line swatch
+        # v1 button with dashed swatch
         v1_btn_frame = tk.Frame(ind_frame, bg=BG3, cursor='hand2', relief='flat', bd=0)
         v1_btn_frame.pack(side='left', fill='x', expand=True, padx=(0, 3))
         c1 = tk.Canvas(v1_btn_frame, width=24, height=14, bg=BG3, highlightthickness=0)
@@ -1021,7 +1088,7 @@ class GaitAnalysisDashboard(tk.Tk):
         for w in (v1_btn_frame, c1, self._v1_toggle_lbl):
             w.bind('<Button-1>', lambda e: self._toggle_video_view(0))
 
-        # V2 button with solid line swatch
+        # v2 button with solid swatch
         v2_btn_frame = tk.Frame(ind_frame, bg=BG3, cursor='hand2', relief='flat', bd=0)
         v2_btn_frame.pack(side='left', fill='x', expand=True, padx=(3, 0))
         c2 = tk.Canvas(v2_btn_frame, width=24, height=14, bg=BG3, highlightthickness=0)
@@ -1044,7 +1111,7 @@ class GaitAnalysisDashboard(tk.Tk):
             jf = tk.Frame(self._legend_frame, bg=BG3, cursor='hand2')
             jf.pack(fill='x', padx=4, pady=2)
 
-            # color swatch with line samples
+            # line samples for both videos
             swatch = tk.Canvas(jf, width=36, height=18, bg=BG3, highlightthickness=0)
             swatch.pack(side='left', padx=(4, 2), pady=2)
             swatch.create_line(2, 9, 16, 9, fill=col, dash=(4, 3), width=2)  # v1 dashed
@@ -1069,7 +1136,7 @@ class GaitAnalysisDashboard(tk.Tk):
         # separator
         tk.Frame(self._legend_frame, bg=SUBTEXT, height=1).pack(fill='x', padx=6, pady=(4, 4))
 
-        # display toggles: mean, data, normal
+        # display toggles for cycle view
         self._display_btns = {}
         for label, key in [("Mean", "mean"), ("Data", "data"), ("Normal", "normal")]:
             btn = tk.Button(self._legend_frame, text=label,
@@ -1078,6 +1145,33 @@ class GaitAnalysisDashboard(tk.Tk):
                         command=lambda k=key: self._toggle_display_option(k))
             btn.pack(fill='x', padx=4, pady=1)
             self._display_btns[key] = btn
+
+        tk.Frame(self._legend_bottom, bg=SUBTEXT, height=1).pack(fill='x', padx=2, pady=(0, 4))
+
+        self._sidebar_toggle_btns = {}
+        for label, key, cmd in [
+            ("Cycles", "cycles", self._toggle_cycles),
+            ("World", "world_px", self._toggle_world),
+        ]:
+            btn = tk.Button(self._legend_bottom, text=label,
+                        font=("Helvetica", 7, "bold"), bg=BG3, fg=TEXT,
+                        relief='flat', cursor='hand2', command=cmd)
+            btn.pack(fill='x', pady=1)
+            self._sidebar_toggle_btns[key] = btn
+
+        tk.Frame(self._legend_bottom, bg=SUBTEXT, height=1).pack(fill='x', padx=2, pady=(4, 4))
+
+        self._clear_btns = {}
+        for label, key, cmd in [
+            ("Clear Steps", "clear_steps", self._clear_steps),
+            ("Clear Excl", "clear_excl", self._clear_exclusions),
+        ]:
+            btn = tk.Button(self._legend_bottom, text=label,
+                        font=("Helvetica", 7, "bold"), bg=BG3, fg=TEXT,
+                        relief='flat', cursor='hand2', command=cmd)
+            btn.pack(fill='x', pady=1)
+            self._clear_btns[key] = btn
+
         self._update_display_btn_visuals()
 
         # video panels
@@ -1123,7 +1217,7 @@ class GaitAnalysisDashboard(tk.Tk):
             val_lbl.pack(anchor='w', pady=(2, 0))
             self._metric_value_lbls[key] = val_lbl
 
-        # colour key
+        # color key
         tk.Frame(right, bg=BG2, height=1).pack(fill='x', padx=8, pady=(8, 0))
         kf = tk.Frame(right, bg=BG2)
         kf.pack(fill='x', padx=10, pady=4)
@@ -1135,10 +1229,11 @@ class GaitAnalysisDashboard(tk.Tk):
             tk.Label(row, text=f"  {label}", font=("Helvetica", 8),
                      bg=BG2, fg=SUBTEXT).pack(side='left')
 
-        # toolbar / status bar
+        # toolbar and status bar
         bottom = tk.Frame(self, bg=BG2, height=36)
         bottom.pack(fill='x', side='bottom')
         bottom.pack_propagate(False)
+        self._bottom_bar = bottom
 
         self._prog_canvas = tk.Canvas(bottom, height=4, bg=BG3, highlightthickness=0)
         self._prog_canvas.pack(fill='x', side='top')
@@ -1154,14 +1249,7 @@ class GaitAnalysisDashboard(tk.Tk):
             ("Prev",         self._prev_frame),
             ("Next",         self._next_frame),
             ("Play",         self._toggle_play),
-            ("Cycles",       self._toggle_cycles),
-            ("World/Px",     self._toggle_world),
-            ("Graph V",      self._cycle_graph_view),
-            ("Active V",     self._toggle_active),
-            ("Auto steps",   self._recompute_steps),
-            ("Show Sugg",    self._toggle_suggestions),
-            ("Clr steps",    self._clear_steps),
-            ("Clr Excl",     self._clear_exclusions),
+            #("Auto steps",   self._recompute_steps),
         ]
         for txt, cmd in buttons:
             tk.Button(bar, text=txt, command=cmd, **btn_cfg).pack(side='left', padx=2, pady=3)
@@ -1205,11 +1293,33 @@ class GaitAnalysisDashboard(tk.Tk):
 
         results          = [None, None]
         results_progress = [0.0, 0.0]
+        
+        # estimate a shared output size from both cropped videos
+        self._status_msg.set("Detecting crop regions…")
+        self.update()
+        target_output_size = None
+        try:
+            sizes = []
+            for path in video_paths:
+                needs_rot = _detect_subject_orientation(path)
+                dims = _get_cropped_dimensions(path, needs_rot)
+                if dims:
+                    sizes.append(dims)
+            
+            if len(sizes) == 2:
+                # use the larger dimensions so both videos fit
+                target_w = max(sizes[0][0], sizes[1][0])
+                target_h = max(sizes[0][1], sizes[1][1])
+                target_output_size = (target_w, target_h)
+                self._status_msg.set(f"Target output: {target_w}x{target_h}")
+                self.update()
+        except Exception as e:
+            print(f"Warning: Could not pre-detect crop size: {e}")
 
         def _process(i, path, ann_dir):
             def _prog(p): results_progress[i] = p
             def _stat(s): self.after(0, lambda: self._status_msg.set(s))
-            results[i] = process_video(path, ann_dir, _prog, _stat)
+            results[i] = process_video(path, ann_dir, _prog, _stat, target_output_size=target_output_size)
 
         def _poll_loading():
             p = (results_progress[0] + results_progress[1]) / 2
@@ -1233,13 +1343,13 @@ class GaitAnalysisDashboard(tk.Tk):
             self.angle_data   = results[0]['angle_data']
             self.total_frames = max(len(results[0]['all_landmarks']),
                                     len(results[1]['all_landmarks']))
-            # initialize zoom tracking with range limited to smallest video
+            # initialize zoom limits from the shorter video
             min_video_frames = min(len(results[0]['all_landmarks']),
                                    len(results[1]['all_landmarks']))
             if not self.angle_data.empty:
                 data_min = self.angle_data['frame_num'].min()
                 self._ax_xlim_full = (data_min, data_min + min_video_frames)
-                # store per-view limits
+                # store limits for each graph view
                 self._ax_xlim_per_mode['both'] = self._ax_xlim_full
                 for i, ds in enumerate(results[:2]):
                     v_frames = len(ds['all_landmarks'])
@@ -1247,8 +1357,11 @@ class GaitAnalysisDashboard(tk.Tk):
             self.progress     = 1.0
             self.show_overlaid_cycles = False
             self.resample_cycles = False
-            self._status_msg.set("Ready  —  press H for help")
-            self.refresh()
+            # clear manual steps before guided markup starts
+            for ds in results:
+                if ds:
+                    ds['step_frames'] = []
+            self._enter_marking_phase('left', 0)
 
         t1 = threading.Thread(target=_process, args=(0, video_paths[0], spill1), daemon=True)
         t2 = threading.Thread(target=_process, args=(1, video_paths[1], spill2), daemon=True)
@@ -1258,7 +1371,7 @@ class GaitAnalysisDashboard(tk.Tk):
 
     # key bindings
     def _bind_keys(self):
-        # bind scroll events to canvas - works with ctrl for zoom, without ctrl for scrub
+        # mouse wheel pans by default and zooms with ctrl
         canvas = self._mpl_canvas.get_tk_widget()
         canvas.bind('<MouseWheel>', self._on_canvas_scroll)
         canvas.bind('<Button-4>', self._on_canvas_scroll)  # linux scroll up
@@ -1273,14 +1386,12 @@ class GaitAnalysisDashboard(tk.Tk):
         self.bind('m',              lambda e: self._toggle_mean())
         self.bind('v',              lambda e: self._cycle_graph_view())
         self.bind('t',              lambda e: self._toggle_active())
-        self.bind('r',              lambda e: self._recompute_steps())
+        #self.bind('r',              lambda e: self._recompute_steps())
         self.bind('g',              lambda e: self._toggle_suggestions())
         self.bind('d',              lambda e: self._clear_steps())
         self.bind('<space>',        lambda e: self._add_manual_step())
         self.bind('<BackSpace>',    lambda e: self._delete_nearest_step())
         self.bind('<Delete>',       lambda e: self._delete_nearest_step())
-        self.bind('h',              lambda e: self._show_help())
-        self.bind('H',              lambda e: self._show_help())
         self.bind('z',              lambda e: self._reset_zoom())
         for k, jt in [('3','left_hip'),('4','right_hip'),('5','left_knee'),
                        ('6','right_knee'),('7','left_ankle'),('8','right_ankle')]:
@@ -1316,7 +1427,7 @@ class GaitAnalysisDashboard(tk.Tk):
         if not excluded_regions or angle_data.empty:
             return angle_data
         
-        # create mask for rows not in any excluded region
+        # keep only rows outside excluded regions
         mask = pd.Series([True] * len(angle_data), index=angle_data.index)
         for start_frame, end_frame in excluded_regions:
             mask &= ~((angle_data['frame_num'] >= start_frame) & (angle_data['frame_num'] < end_frame))
@@ -1325,7 +1436,7 @@ class GaitAnalysisDashboard(tk.Tk):
 
     def _region_crosses_exclusion(self, start_frame, end_frame, excluded_regions):
         for ex_start, ex_end in excluded_regions:
-            # check if exclusion overlaps with this region
+            # return true when this range overlaps an exclusion
             if not (end_frame <= ex_start or start_frame >= ex_end):
                 return True
         return False
@@ -1338,7 +1449,7 @@ class GaitAnalysisDashboard(tk.Tk):
         merged = [regions[0]]
         for s, e in regions[1:]:
             prev_s, prev_e = merged[-1]
-            if s <= prev_e:  # overlapping or adjacent
+            if s <= prev_e:  # merge overlapping or adjacent ranges
                 merged[-1] = (prev_s, max(prev_e, e))
             else:
                 merged.append((s, e))
@@ -1386,7 +1497,7 @@ class GaitAnalysisDashboard(tk.Tk):
             mapped.sort(key=lambda x: x[0])
             return mapped
 
-        # calculate max cycle length for overlaid mode before plotting
+        # find the longest usable cycle for overlaid mode
         max_cycle_length = self.resample_length
         if self.show_overlaid_cycles:
             for ds in dfg:
@@ -1403,7 +1514,7 @@ class GaitAnalysisDashboard(tk.Tk):
                     if len(strikes) < 2: continue
                     
                     for i in range(len(strikes)-1):
-                        # skip step pairs that cross exclusion regions
+                        # skip step pairs that cross excluded regions
                         if self._region_crosses_exclusion(strikes[i], strikes[i+1], excluded):
                             continue
                             
@@ -1426,7 +1537,7 @@ class GaitAnalysisDashboard(tk.Tk):
                 si  = _src_idx(ds)
                 ls  = linestyles[si % 2]
 
-                # Build exclusion mask for this dataset
+                # build an exclusion mask for this dataset
                 frames = ad['frame_num'].values
                 excl_mask = np.zeros(len(frames), dtype=bool)
                 for ex_s, ex_e in excluded:
@@ -1441,13 +1552,13 @@ class GaitAnalysisDashboard(tk.Tk):
                     values = ad[joint].values.copy().astype(float)
 
                     if excluded:
-                        # Gray line in excluded regions (only for visible joints)
+                        # draw excluded segments in gray
                         gray_vals = values.copy()
                         gray_vals[~excl_mask] = np.nan
                         ax.plot(frames, gray_vals, color='#999999', lw=1.2,
                                 alpha=0.5, linestyle=ls, zorder=2)
 
-                    # Non-excluded data
+                    # draw the remaining data in the joint color
                     clean_vals = values.copy()
                     if excluded:
                         clean_vals[excl_mask] = np.nan
@@ -1464,12 +1575,12 @@ class GaitAnalysisDashboard(tk.Tk):
                         ax.axvline(f, color=C_RIGHT if side=='right' else C_LEFT,
                                    lw=0.8, alpha=0.7, linestyle=ls)
 
-                # draw suggested steps if enabled (exclude those in excluded regions)
+                # draw suggested steps when enabled
                 if self.show_suggestions:
                     ssf = ds.get('suggested_step_frames', [])
                     suggested = _to_fnums(ad_filtered, ssf)
                     
-                    # show triangles at top of graph for suggested steps
+                    # place suggestion markers near the top of the graph
                     if suggested:
                         y_min, y_max = ax.get_ylim()
                         y_position = y_max - (y_max - y_min) * 0.05
@@ -1490,7 +1601,7 @@ class GaitAnalysisDashboard(tk.Tk):
                 cf = ref_ad['frame_num'].iloc[self.current_frame_idx]
                 ax.axvline(cf, color=C_CURSOR, lw=1.5, linestyle='--', zorder=10)
 
-            # secondary time axis (top)
+            # add a time axis on top
             def f2s(x): return x / SLOWMO_FPS
             def s2f(x): return x * SLOWMO_FPS
             ax2 = ax.secondary_xaxis('top', functions=(f2s, s2f))
@@ -1524,7 +1635,7 @@ class GaitAnalysisDashboard(tk.Tk):
                     excluded = ds.get('excluded_regions', [])
                     
                     for i in range(len(strikes)-1):
-                        # skip step pairs that cross exclusion regions
+                        # skip step pairs that cross excluded regions
                         if self._region_crosses_exclusion(strikes[i], strikes[i+1], excluded):
                             continue
                         
@@ -1542,12 +1653,12 @@ class GaitAnalysisDashboard(tk.Tk):
 
                     if self.show_data:
                         for (x, y), good in zip(cycles, ok):
+                            if not good: continue
                             if self.resample_cycles:
                                 t = np.linspace(0, 1, len(y))
                                 y = interp1d(t, y)(np.linspace(0, 1, max_cycle_length))
                                 x = np.arange(max_cycle_length)
-                            c = col if good else C_OUTLIER
-                            ax.plot(x, y, color=c, alpha=0.25, lw=0.8, linestyle=ls)
+                            ax.plot(x, y, color=col, alpha=0.25, lw=0.8, linestyle=ls)
 
                     if self.resample_cycles and self.show_mean:
                         inliers = []
@@ -1562,7 +1673,7 @@ class GaitAnalysisDashboard(tk.Tk):
                                     label=f"{joint.replace('_',' ').title()} V{si+1} mean")
 
             if self.resample_cycles and self.show_normative:
-                # Create x-axis for normative data matching graph x-range
+                # scale normative data to the current x range
                 norm_x_resampled = np.linspace(0, max_cycle_length, 100)
                 
                 for jt_key in ('hip', 'knee', 'ankle'):
@@ -1573,22 +1684,21 @@ class GaitAnalysisDashboard(tk.Tk):
                         ax.fill_between(norm_x_resampled, d['lower'], d['upper'],
                                         color=C_NORM, alpha=0.12,
                                         label=f'{jt_key.title()} norm.')
-        # draw exclusion overlays for all datasets
+        # shade excluded regions
         for ds in dfg:
             excluded = ds.get('excluded_regions', [])
             for start_frame, end_frame in excluded:
                 ax.axvspan(start_frame, end_frame, alpha=0.05, color='darkgray', zorder=1)
 
-        # set axis limits after plotting to prevent auto-scaling
-        # determine appropriate limits based on current view
+        # set x limits after plotting to avoid autoscaling drift
         if self.show_overlaid_cycles:
-            # overlaid cycles: x-axis scales to longest actual stride
+            # overlaid cycles use the longest actual stride
             ax.set_xlim(0, self._current_max_cycle_length)
         elif self._ax_xlim_full is not None:
-            # continuous view: use frame range
+            # continuous view uses the frame range
             ax.set_xlim(self._ax_xlim_full)
 
-        # use subplots_adjust instead of tight_layout to maintain static graph size
+        # keep graph size stable across redraws
         self._fig.subplots_adjust(left=0.06, right=0.98, top=0.95, bottom=0.12)
         self._update_scrollbar()
         self._mpl_canvas.draw_idle()
@@ -1607,12 +1717,12 @@ class GaitAnalysisDashboard(tk.Tk):
                 entry = None
                 if 0 <= self.current_frame_idx < len(store):
                     entry = store[self.current_frame_idx]
-                # New format: (raw_path, pixel_landmarks) tuple
+                # current format stores a raw path plus pixel landmarks
                 if isinstance(entry, tuple):
                     frame = self._cache.get(vi, self.current_frame_idx, store)
                     pixel_lm = entry[1]
                 else:
-                    # Legacy: annotated frame path or numpy array
+                    # older data may store a frame path or array directly
                     frame = self._cache.get(vi, self.current_frame_idx, store)
 
             canvas.delete('all')
@@ -1621,18 +1731,17 @@ class GaitAnalysisDashboard(tk.Tk):
                                    fill=SUBTEXT, font=("Helvetica", 10))
                 continue
 
-            # Draw skeleton at render time with dynamic joint visibility
+            # draw the skeleton at render time using current joint visibility
             if pixel_lm is not None:
                 frame = frame.copy()
                 draw_pose_landmarks_on_frame(frame, pixel_lm, self.joint_visibility)
 
-            # Analysis frames always have the person sideways — rotate 90° CW
-            # so the person appears upright in the GUI
+            # rotate the analysis frame so the person appears upright in the gui
             frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
 
             rgb    = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-            # Determine if this video should be shown based on graph_show_mode
+            # dim videos that are not active in the current graph view
             show_v1 = self.graph_show_mode in ('v1', 'both')
             show_v2 = self.graph_show_mode in ('v2', 'both')
             is_inactive = (vi == 0 and not show_v1) or (vi == 1 and not show_v2)
@@ -1645,7 +1754,7 @@ class GaitAnalysisDashboard(tk.Tk):
             nw, nh = int(fw*scale), int(fh*scale)
             rgb    = cv2.resize(rgb, (nw, nh), interpolation=cv2.INTER_AREA)
             img    = ImageTk.PhotoImage(Image.fromarray(rgb))
-            canvas._img = img   # keep reference
+            canvas._img = img   # keep a reference for tkinter
             canvas.create_image((cw-nw)//2, (ch-nh)//2, anchor='nw', image=img)
 
     # refresh
@@ -1695,7 +1804,7 @@ class GaitAnalysisDashboard(tk.Tk):
         fn  = ad['frame_num'].to_numpy()
         idx = int(np.argmin(np.abs(fn - event.xdata)))
         self.current_frame_idx = max(0, min(idx, len(ad)-1))
-        # preserve zoom level when scrubbing
+        # preserve zoom while scrubbing
         current_xlim = self._ax.get_xlim()
         self._show_video_frames()
         self._update_status()
@@ -1708,9 +1817,9 @@ class GaitAnalysisDashboard(tk.Tk):
         if event.button == 1 and event.inaxes == self._ax:
             self._graph_dragging = True
             self._seek_from_event(event)
-            # don't reset zoom - just move scrubber line
+            # keep the current zoom and only move the scrubber
         elif event.button == 3 and event.inaxes == self._ax:
-            # right-click to start exclusion selection
+            # start selecting an exclusion with right click
             self._exclusion_selecting = True
             self._exclusion_start = event.xdata
 
@@ -1722,29 +1831,29 @@ class GaitAnalysisDashboard(tk.Tk):
         if event.button == 1:
             self._graph_dragging = False
         elif event.button == 3:
-            # Right-click release - finalize exclusion
+            # finish the exclusion on right button release
             if self._exclusion_selecting and self._exclusion_start is not None and event.xdata is not None:
                 start_frame = round(self._exclusion_start)
                 end_frame = round(event.xdata)
-                # Ensure start < end
+                # keep the range ordered
                 if start_frame > end_frame:
                     start_frame, end_frame = end_frame, start_frame
-                # Only add if selection is meaningful (> 1 frame)
+                # ignore one frame selections
                 if end_frame > start_frame:
                     target_datasets = []
                     
-                    # Determine which dataset(s) to apply exclusion to
+                    # choose the dataset or datasets that should receive the exclusion
                     if self.graph_show_mode == 'v1' and len(self.datasets) >= 1:
                         target_datasets = [self.datasets[0]]
                     elif self.graph_show_mode == 'v2' and len(self.datasets) >= 2:
                         target_datasets = [self.datasets[1]]
                     elif self.graph_show_mode == 'both' and len(self.datasets) >= 2:
-                        # Apply to both videos when in "both" view
+                        # apply to both videos in combined view
                         target_datasets = [self.datasets[0], self.datasets[1]]
                     else:
                         target_datasets = [self._active_ds()]
                     
-                    # Apply exclusion to all target datasets
+                    # apply the exclusion to each selected dataset
                     for target_ds in target_datasets:
                         if target_ds:
                             target_ds.setdefault('excluded_regions', []).append((start_frame, end_frame))
@@ -1752,7 +1861,7 @@ class GaitAnalysisDashboard(tk.Tk):
                                 target_ds['excluded_regions'])
                     
                     self._status_msg.set(f"Excluded frames {start_frame}-{end_frame} in both videos")
-                    self._recompute_steps()  # Recompute with filtered data
+                        #self._recompute_steps()  # recompute with filtered data
             self._exclusion_selecting = False
             self._exclusion_start = None
 
@@ -1760,14 +1869,14 @@ class GaitAnalysisDashboard(tk.Tk):
         if self.angle_data is None or self.angle_data.empty:
             return
         
-        # disable scrolling in overlaid cycles mode (viewing normalized cycles)
+        # disable scrolling in overlaid cycle view
         if self.show_overlaid_cycles:
             return
         
-        # store event for zoom-on-cursor
+        # keep the last wheel event for cursor based zoom
         self._last_scroll_event = event
         
-        # determine scroll direction (works on windows, mac, and linux)
+        # normalize wheel direction across platforms
         if hasattr(event, 'delta'):
             scroll_dir = 1 if event.delta > 0 else -1
         elif hasattr(event, 'num'):
@@ -1775,8 +1884,8 @@ class GaitAnalysisDashboard(tk.Tk):
         else:
             return
         
-        # check if ctrl is held - determines zoom vs pan
-        ctrl_held = bool(event.state & 0x0004)  # 0x0004 is ctrl mask
+        # ctrl switches the wheel from pan to zoom
+        ctrl_held = bool(event.state & 0x0004)  # ctrl mask
         
         if ctrl_held:
             self._on_graph_zoom(scroll_dir)
@@ -1787,12 +1896,12 @@ class GaitAnalysisDashboard(tk.Tk):
         cur_xlim = self._ax.get_xlim()
         xlim_full = self._get_current_xlim_full()
         full_min, full_max = xlim_full
-        pan_amount = (full_max - full_min) * 0.1 * direction  # 10% of range
+        pan_amount = (full_max - full_min) * 0.1 * direction  # move by ten percent of the range
         
         new_xlim_min = cur_xlim[0] - pan_amount
         new_xlim_max = cur_xlim[1] - pan_amount
         
-        # clamp to data bounds
+        # clamp the pan range to the full data bounds
         if new_xlim_min < full_min:
             new_xlim_min = full_min
             new_xlim_max = full_min + (cur_xlim[1] - cur_xlim[0])
@@ -1805,53 +1914,53 @@ class GaitAnalysisDashboard(tk.Tk):
         self._mpl_canvas.draw_idle()
     
     def _on_graph_zoom(self, direction):
-        # get current axis limits
+        # read the current axis limits
         cur_xlim = self._ax.get_xlim()
         xlim_full = self._get_current_xlim_full()
         full_min, full_max = xlim_full
         full_range = full_max - full_min
         
-        # zoom factor (direction = -1 for zoom in, 1 for zoom out)
+        # negative direction zooms in and positive direction zooms out
         zoom_factor = 0.8 if direction < 0 else 1.2
         
-        # get zoom center from cursor position if available
+        # use the cursor position as the zoom center when possible
         zoom_center = None
         if self._last_scroll_event:
             if hasattr(self._last_scroll_event, 'xdata') and self._last_scroll_event.xdata is not None:
                 zoom_center = self._last_scroll_event.xdata
             elif hasattr(self._last_scroll_event, 'x'):
-                # Convert pixel coordinates to data coordinates
+                # convert display pixels into data coordinates
                 try:
-                    # get the axes bounding box in display coordinates
+                    # get the axes bounds in display space
                     bbox = self._ax.get_window_extent()
-                    # get event position in display space
+                    # get the event x position in display space
                     x_pixel = self._last_scroll_event.x
-                    # convert to axes space (0 to 1)
+                    # convert into normalized axes space
                     x_normalized = (x_pixel - bbox.x0) / bbox.width
-                    # convert to data space
+                    # convert the normalized position into data space
                     if 0 <= x_normalized <= 1:
                         zoom_center = cur_xlim[0] + x_normalized * (cur_xlim[1] - cur_xlim[0])
                 except:
                     pass
         
-        # fallback to center if we couldn't determine cursor position
+        # fall back to the current midpoint when needed
         if zoom_center is None:
             zoom_center = (cur_xlim[0] + cur_xlim[1]) / 2
         
-        # calculate new width
+        # calculate the new visible width
         new_width = (cur_xlim[1] - cur_xlim[0]) * zoom_factor
         
-        # clamp to minimum zoom (show full range)
+        # stop zooming out past the full range
         if new_width >= full_range:
             new_xlim_min = full_min
             new_xlim_max = full_max
         else:
-            # calculate position relative to cursor
+            # preserve the cursor position inside the current window
             rel_pos = (zoom_center - cur_xlim[0]) / (cur_xlim[1] - cur_xlim[0])
             new_xlim_min = zoom_center - new_width * rel_pos
             new_xlim_max = new_xlim_min + new_width
             
-            # pan to stay in bounds
+            # shift back into bounds when needed
             if new_xlim_min < full_min:
                 new_xlim_min = full_min
                 new_xlim_max = full_min + new_width
@@ -1859,7 +1968,7 @@ class GaitAnalysisDashboard(tk.Tk):
                 new_xlim_max = full_max
                 new_xlim_min = full_max - new_width
         
-        # apply new limits
+        # apply the updated limits
         self._ax.set_xlim(new_xlim_min, new_xlim_max)
         self._update_scrollbar()
         self._mpl_canvas.draw_idle()
@@ -1878,15 +1987,15 @@ class GaitAnalysisDashboard(tk.Tk):
         full_min, full_max = xlim_full
         full_range = full_max - full_min
         
-        # calculate scrollbar position
+        # calculate the scrollbar thumb position
         first = (cur_xlim[0] - full_min) / full_range
         last = (cur_xlim[1] - full_min) / full_range
         
-        # set scrollbar
+        # update the scrollbar thumb
         self._graph_hbar.set(first, last)
     
     def _on_scrollbar_drag(self, *args):
-        # disable scrollbar in overlaid cycles mode (viewing normalized cycles)
+        # disable the scrollbar in overlaid cycle view
         if self.show_overlaid_cycles:
             return
         
@@ -1898,26 +2007,25 @@ class GaitAnalysisDashboard(tk.Tk):
         full_range = full_max - full_min
         cur_width = self._ax.get_xlim()[1] - self._ax.get_xlim()[0]
         
-        # parse tkinter scrollbar callback arguments
-        # scrollbar sends either ('moveto', fraction) or ('scroll', amount, 'units')
+        # parse the tkinter scrollbar callback arguments
         if args[0] == 'moveto':
-            # direct position command from scrollbar drag
+            # direct drag command from the scrollbar
             fraction = float(args[1])
             new_xlim_min = full_min + fraction * full_range
             new_xlim_max = new_xlim_min + cur_width
-            # Clamp to bounds
+            # clamp the view to the valid range
             if new_xlim_max > full_max:
                 new_xlim_max = full_max
                 new_xlim_min = full_max - cur_width
         elif args[0] == 'scroll':
-            # arrow or page scroll
+            # arrow or page step from the scrollbar
             amount = int(args[1])
             units = args[2] if len(args) > 2 else 'units'
             scroll_amount = full_range * 0.1 * amount
             cur_xlim = self._ax.get_xlim()
             new_xlim_min = cur_xlim[0] - scroll_amount
             new_xlim_max = cur_xlim[1] - scroll_amount
-            # Clamp to bounds
+            # clamp the view to the valid range
             if new_xlim_min < full_min:
                 new_xlim_min = full_min
                 new_xlim_max = full_min + cur_width
@@ -1935,7 +2043,7 @@ class GaitAnalysisDashboard(tk.Tk):
         if not self.playing: return
         if self.current_frame_idx < self._active_max_index():
             self.current_frame_idx += 1
-            # preserve zoom level during playback
+            # preserve zoom during playback
             current_xlim = self._ax.get_xlim()
             self._show_video_frames()
             self.redraw_graph()
@@ -1952,7 +2060,15 @@ class GaitAnalysisDashboard(tk.Tk):
     def _prev_frame(self):
         if self.playing: return
         self.current_frame_idx = max(0, self.current_frame_idx - 1)
-        # preserve zoom level
+        if self._marking_phase:
+            t = self.current_frame_idx / SLOWMO_FPS
+            self._markup_frame_lbl.config(
+                text=f"Frame {self.current_frame_idx + 1}  ({t:.2f} s)")
+            self._markup_show_frames()
+            self._redraw_markup_graph()
+            return
+
+        # preserve zoom
         current_xlim = self._ax.get_xlim()
         self._show_video_frames()
         self.redraw_graph()
@@ -1962,8 +2078,19 @@ class GaitAnalysisDashboard(tk.Tk):
 
     def _next_frame(self):
         if self.playing: return
+        if self._marking_phase:
+            vi = self._marking_video_idx
+            max_idx = (len(self.datasets[vi].get('all_landmarks', [])) - 1
+                       if vi < len(self.datasets) else self._active_max_index())
+            self.current_frame_idx = min(max_idx, self.current_frame_idx + 1)
+            t = self.current_frame_idx / SLOWMO_FPS
+            self._markup_frame_lbl.config(
+                text=f"Frame {self.current_frame_idx + 1}  ({t:.2f} s)")
+            self._markup_show_frames()
+            self._redraw_markup_graph()
+            return
         self.current_frame_idx = min(self._active_max_index(), self.current_frame_idx + 1)
-        # preserve zoom level
+        # preserve zoom
         current_xlim = self._ax.get_xlim()
         self._show_video_frames()
         self.redraw_graph()
@@ -1991,7 +2118,7 @@ class GaitAnalysisDashboard(tk.Tk):
 
     def _toggle_cycles(self):
         self.show_overlaid_cycles = not self.show_overlaid_cycles
-        # auto-enable resampling when entering overlaid cycles mode
+        # enable resampling automatically in overlaid cycle view
         if self.show_overlaid_cycles:
             self.resample_cycles = True
         self._status_msg.set("Overlaid cycles" if self.show_overlaid_cycles else "Continuous view")
@@ -2030,7 +2157,7 @@ class GaitAnalysisDashboard(tk.Tk):
             show_v1 = not show_v1
         else:
             show_v2 = not show_v2
-        # prevent both hidden
+        # prevent hiding both videos at once
         if not show_v1 and not show_v2:
             show_v1 = True
             show_v2 = True
@@ -2040,10 +2167,10 @@ class GaitAnalysisDashboard(tk.Tk):
             self.graph_show_mode = 'v1'
         else:
             self.graph_show_mode = 'v2'
-        # Update zoom limits for this view mode
+        # load the saved zoom range for this view
         if self.graph_show_mode in self._ax_xlim_per_mode:
             self._ax_xlim_full = self._ax_xlim_per_mode[self.graph_show_mode]
-        # Reset zoom when switching views
+        # reset zoom when the view changes
         if self._ax_xlim_full is not None:
             self._ax.set_xlim(self._ax_xlim_full)
         labels = {'both': 'Both', 'v1': 'V1 only', 'v2': 'V2 only'}
@@ -2084,10 +2211,10 @@ class GaitAnalysisDashboard(tk.Tk):
         modes  = ['both', 'v1', 'v2']
         labels = {'both': 'Both', 'v1': 'V1 only', 'v2': 'V2 only'}
         self.graph_show_mode = modes[(modes.index(self.graph_show_mode)+1) % 3]
-        # Update zoom limits for this view mode
+        # load the saved zoom range for this view
         if self.graph_show_mode in self._ax_xlim_per_mode:
             self._ax_xlim_full = self._ax_xlim_per_mode[self.graph_show_mode]
-        # Reset zoom when switching views
+        # reset zoom when the view changes
         if self._ax_xlim_full is not None:
             self._ax.set_xlim(self._ax_xlim_full)
         self._status_msg.set(f"Graph: {labels[self.graph_show_mode]}")
@@ -2173,6 +2300,16 @@ class GaitAnalysisDashboard(tk.Tk):
             else:
                 btn.config(bg=BG3, fg=TEXT, state='normal')
 
+        if self.show_overlaid_cycles:
+            self._sidebar_toggle_btns['cycles'].config(bg=ACCENT, fg='white')
+        else:
+            self._sidebar_toggle_btns['cycles'].config(bg=BG3, fg=TEXT)
+
+        if USE_WORLD_LANDMARKS:
+            self._sidebar_toggle_btns['world_px'].config(text="Pixel", bg=ACCENT, fg='white')
+        else:
+            self._sidebar_toggle_btns['world_px'].config(text="World", bg=BG3, fg=TEXT)
+
     def _toggle_manual_step(self):
         self.manual_step_mode = not self.manual_step_mode
         self._status_msg.set(
@@ -2183,7 +2320,11 @@ class GaitAnalysisDashboard(tk.Tk):
         self._status_msg.set(f"Manual side: {side.upper()}")
 
     def _add_manual_step(self):
-        # determine which dataset to add step to based on graph view mode
+        # route step input to guided markup when active
+        if self._marking_phase:
+            self._markup_add_step()
+            return
+        # choose the dataset from the current graph view
         if self.graph_show_mode == 'v1' and len(self.datasets) >= 1:
             ds = self.datasets[0]
         elif self.graph_show_mode == 'v2' and len(self.datasets) >= 2:
@@ -2195,12 +2336,12 @@ class GaitAnalysisDashboard(tk.Tk):
         idx = min(self.current_frame_idx, len(ds['angle_data'])-1)
         fn  = int(ds['angle_data']['frame_num'].iloc[idx])
         
-        # auto-detect foot from nearest suggested step
+        # infer the foot from the nearest suggestion
         suggested = ds.get('suggested_step_frames', [])
-        detected_foot = 'right'  # default
+        detected_foot = 'right'  # fallback side
         
         if suggested:
-        # find nearest suggested step
+        # find the nearest suggested step
             nearest_idx = min(range(len(suggested)), key=lambda i: abs(suggested[i][0] - fn))
             detected_foot = suggested[nearest_idx][1]
         
@@ -2214,7 +2355,7 @@ class GaitAnalysisDashboard(tk.Tk):
         self._update_scrollbar()
 
     def _delete_nearest_step(self):
-        # determine which dataset to delete step from based on graph view mode
+        # choose the dataset from the current graph view
         if self.graph_show_mode == 'v1' and len(self.datasets) >= 1:
             ds = self.datasets[0]
         elif self.graph_show_mode == 'v2' and len(self.datasets) >= 2:
@@ -2241,7 +2382,7 @@ class GaitAnalysisDashboard(tk.Tk):
         total_steps = 0
         for ds in self.datasets:
             if ds and 'angle_data' in ds:
-                # use filtered angle data excluding regions
+                # detect steps from data with exclusions removed
                 excluded = ds.get('excluded_regions', [])
                 filtered_ad = self._get_filtered_angle_data(ds['angle_data'], excluded)
                 ds['suggested_step_frames'] = detect_steps(
@@ -2274,34 +2415,350 @@ class GaitAnalysisDashboard(tk.Tk):
             if ds:
                 ds['excluded_regions'] = []
         self._status_msg.set("All exclusions cleared")
-        self._recompute_steps()  # recalculate steps with full data
+        #self._recompute_steps()  # recalculate steps with full data
         self.redraw_graph()
 
-    # help window
-    def _show_help(self):
-        win = tk.Toplevel(self)
-        win.title("Keyboard Shortcuts")
-        win.configure(bg=BG)
-        win.resizable(False, False)
-        for i, (key, desc) in enumerate(HELP_TEXT):
-            if desc is None:          # section header
-                tk.Label(win, text=key, font=("Helvetica", 10, "bold"),
-                         bg=BG, fg=ACCENT, anchor='w'
-                         ).grid(row=i, column=0, columnspan=2,
-                                sticky='w', padx=16, pady=(10, 2))
-            elif key == "":           # spacer
-                tk.Label(win, text="", bg=BG, height=0
-                         ).grid(row=i, column=0)
-            else:
-                tk.Label(win, text=key, font=("Courier", 9, "bold"),
-                         bg=BG, fg=ACCENT, width=18, anchor='w'
-                         ).grid(row=i, column=0, sticky='w', padx=(16, 4), pady=1)
-                tk.Label(win, text=desc, font=("Helvetica", 9),
-                         bg=BG, fg=TEXT, anchor='w'
-                         ).grid(row=i, column=1, sticky='w', padx=(0, 16), pady=1)
-        tk.Button(win, text="Close", command=win.destroy,
-                  bg=ACCENT, fg='white', relief='flat', padx=14
-                  ).grid(row=len(HELP_TEXT), column=0, columnspan=2, pady=14)
+    # guided step marking screen
+
+    def _build_markup_screen(self):
+        self._markup_frame = tk.Frame(self, bg=BG)
+
+        self._markup_banner_area = tk.Frame(self._markup_frame, bg=BG2)
+        self._markup_banner_area.pack(fill='x')
+
+        top_row = tk.Frame(self._markup_banner_area, bg=BG2)
+        top_row.pack(fill='x', padx=20, pady=(10, 0))
+
+        self._markup_step_lbl = tk.Label(
+            top_row, text="STEP  1  OF  4",
+            font=("Helvetica", 9, "bold"), bg=BG2, fg=SUBTEXT, anchor='w')
+        self._markup_step_lbl.pack(side='left')
+
+        # small badge showing the active side
+        self._markup_side_badge = tk.Label(
+            top_row, text=" LEFT ",
+            font=("Helvetica", 9, "bold"), bg=C_LEFT, fg='white', padx=6, pady=1)
+        self._markup_side_badge.pack(side='left', padx=(10, 0))
+
+        self._markup_count_lbl = tk.Label(
+            top_row, text="0 steps marked",
+            font=("Helvetica", 10, "bold"), bg=BG2, fg=C_LEFT, anchor='e')
+        self._markup_count_lbl.pack(side='right')
+
+        # compact title row
+        title_row = tk.Frame(self._markup_banner_area, bg=BG2)
+        title_row.pack(fill='x', padx=20, pady=(2, 4))
+
+        self._markup_banner_lbl = tk.Label(
+            title_row,
+            text="MARKING   LEFT   STEPS  —  VIDEO 1",
+            font=("Helvetica", 13, "bold"), bg=BG2, fg=ACCENT, anchor='w')
+        self._markup_banner_lbl.pack(side='left')
+
+        self._markup_sub_lbl = tk.Label(
+            title_row,
+            text="· press  SPACE  to mark each LEFT foot strike",
+            font=("Helvetica", 9), bg=BG2, fg=SUBTEXT, anchor='w')
+        self._markup_sub_lbl.pack(side='left', padx=(12, 0))
+
+        # thin separator
+        tk.Frame(self._markup_banner_area, bg=BG3, height=1).pack(fill='x')
+
+        vid_area = tk.Frame(self._markup_frame, bg=BG)
+        vid_area.pack(fill='both', expand=True, padx=8, pady=(8, 0))
+
+        vf = tk.Frame(vid_area, bg=BG2, bd=1, relief='flat')
+        vf.pack(fill='both', expand=True)
+        self._markup_vid_lbl = tk.Label(
+            vf, text="VIDEO 1",
+            font=("Helvetica", 9, "bold"), bg=BG2, fg=C_V1, anchor='w')
+        self._markup_vid_lbl.pack(fill='x', padx=6, pady=(3, 0))
+        self._markup_canvas = tk.Canvas(vf, bg=BG_VID, highlightthickness=0)
+        self._markup_canvas.pack(fill='both', expand=True)
+        # keep the list form for compatibility with existing code
+        self._markup_canvases = [self._markup_canvas]
+
+        graph_area = tk.Frame(self._markup_frame, bg=BG2)
+        graph_area.pack(fill='x', padx=8, pady=(6, 0))
+
+        self._markup_fig, self._markup_ax = plt.subplots(figsize=(12, 1.6), dpi=100)
+        self._markup_fig.patch.set_facecolor(BG2)
+        self._markup_ax.set_facecolor(BG_PLOT)
+        for spine in self._markup_ax.spines.values():
+            spine.set_color(BG2)
+        self._markup_fig.subplots_adjust(left=0.03, right=0.99, top=0.88, bottom=0.28)
+        self._markup_mpl_canvas = FigureCanvasTkAgg(self._markup_fig, master=graph_area)
+        self._markup_mpl_canvas.get_tk_widget().pack(fill='x')
+        self._markup_mpl_canvas.mpl_connect('button_press_event',  self._on_markup_graph_click)
+        self._markup_mpl_canvas.mpl_connect('motion_notify_event', self._on_markup_graph_drag)
+        self._markup_mpl_canvas.mpl_connect('button_release_event', self._on_markup_graph_release)
+        self._markup_graph_dragging = False
+
+        ctrl_row = tk.Frame(self._markup_frame, bg=BG2, height=52)
+        ctrl_row.pack(fill='x', side='bottom')
+        ctrl_row.pack_propagate(False)
+
+        tk.Button(
+            ctrl_row, text="⌫  Undo Last Step",
+            font=("Helvetica", 9), bg=BG3, fg=TEXT,
+            relief='flat', padx=12, cursor='hand2',
+            command=self._markup_remove_last
+        ).pack(side='left', padx=16, pady=10)
+
+        self._markup_frame_lbl = tk.Label(
+            ctrl_row, text="Frame 3  (0.01 s)",
+            font=("Helvetica", 9, "bold"), bg=BG2, fg=TEXT)
+        self._markup_frame_lbl.pack(side='left', padx=(0, 16))
+
+        self._markup_continue_btn = tk.Button(
+            ctrl_row,
+            text="Done  →  Next",
+            font=("Helvetica", 11, "bold"),
+            bg=ACCENT, fg='white', relief='flat', padx=20, cursor='hand2',
+            activebackground='#5a186a', activeforeground='white')
+        self._markup_continue_btn.pack(side='right', padx=20, pady=10)
+
+        tk.Label(
+            ctrl_row,
+            text="Click graph to seek  ·  SPACE = mark step  ·  1/2 = frame by frame",
+            font=("Helvetica", 8), bg=BG2, fg=SUBTEXT
+        ).pack(side='left', padx=8)
+
+    def _enter_marking_phase(self, side, video_idx):
+        self._marking_phase = side
+        self._marking_video_idx = video_idx
+
+        if self._markup_frame is None:
+            self._build_markup_screen()
+
+        self.current_frame_idx = 2
+        t0 = 2 / SLOWMO_FPS
+        self._markup_frame_lbl.config(text=f"Frame 3  ({t0:.2f} s)")
+
+        # phase order is left v1, left v2, right v1, right v2
+        phase_num = 1 + (0 if side == 'left' else 2) + video_idx
+        noun = "LEFT" if side == 'left' else "RIGHT"
+        vid_num = video_idx + 1
+        vid_name = (self.video_names[video_idx]
+                    if video_idx < len(self.video_names) else f"Video {vid_num}")
+        fg_col = C_V1 if video_idx == 0 else C_V2
+        marker_col = C_LEFT if side == 'left' else C_RIGHT
+
+        # choose the next step in the markup flow
+        if side == 'left' and video_idx == 0:
+            continue_txt = "Done  →  Mark LEFT steps on Video 2"
+            continue_cmd = lambda: self._enter_marking_phase('left', 1)
+        elif side == 'left' and video_idx == 1:
+            continue_txt = "Done  →  Mark RIGHT steps on Video 1"
+            continue_cmd = lambda: self._enter_marking_phase('right', 0)
+        elif side == 'right' and video_idx == 0:
+            continue_txt = "Done  →  Mark RIGHT steps on Video 2"
+            continue_cmd = lambda: self._enter_marking_phase('right', 1)
+        else:
+            continue_txt = "Finish  →  View Gait Analysis"
+            continue_cmd = self._exit_marking_phase
+
+        # update the banner widgets
+        self._markup_step_lbl.config(text=f"STEP  {phase_num}  OF  4")
+        self._markup_side_badge.config(text=f"  {noun}  ", bg=marker_col)
+        self._markup_banner_lbl.config(
+            text=f"MARKING   {noun}   STEPS  —  VIDEO {vid_num}")
+        self._markup_sub_lbl.config(
+            text=f"· press  SPACE  to mark each {noun} foot strike  ({vid_name})")
+        self._markup_count_lbl.config(fg=marker_col)
+        self._markup_vid_lbl.config(
+            text=f"VIDEO {vid_num}  —  {vid_name}", fg=fg_col)
+        self._markup_continue_btn.config(text=continue_txt, command=continue_cmd)
+
+        self._markup_count_update()
+        self._markup_show_frames()
+
+        # swap the main dashboard out for the markup screen
+        self._main_content.pack_forget()
+        self._bottom_bar.pack_forget()
+        self._markup_frame.pack(fill='both', expand=True)
+        self._status_msg.set(
+            f"Mark every {noun} foot strike with SPACE — Video {vid_num}")
+        # wait briefly so tkinter can resolve widget geometry
+        self.after(50, self._markup_show_frames)
+        self.after(60, self._redraw_markup_graph)
+
+    def _exit_marking_phase(self):
+        self._marking_phase = None
+        self._markup_frame.pack_forget()
+        self._bottom_bar.pack(fill='x', side='bottom')
+        self._main_content.pack(fill='both', expand=True, padx=8, pady=(4, 0))
+
+        # switch into overlaid cycles when markup is complete
+        self.show_overlaid_cycles = True
+        self.resample_cycles = True
+        self._status_msg.set("Steps confirmed — showing overlaid gait cycles")
+        self._update_display_btn_visuals()
+        self.refresh()
+
+    def _markup_show_frames(self):
+        vi = self._marking_video_idx
+        canvas = self._markup_canvas
+        cw = canvas.winfo_width()
+        ch = canvas.winfo_height()
+        canvas.delete('all')
+
+        frame = None
+        pixel_lm = None
+        if vi < len(self.datasets):
+            store = self.datasets[vi].get('all_landmarks', [])
+            if 0 <= self.current_frame_idx < len(store):
+                entry = store[self.current_frame_idx]
+                if isinstance(entry, tuple):
+                    frame = self._cache.get(vi, self.current_frame_idx, store)
+                    pixel_lm = entry[1]
+                else:
+                    frame = self._cache.get(vi, self.current_frame_idx, store)
+
+        if frame is None or cw < 2 or ch < 2:
+            if cw >= 2 and ch >= 2:
+                canvas.create_text(cw // 2, ch // 2, text="No frame",
+                                   fill=SUBTEXT, font=("Helvetica", 10))
+            return
+
+        if pixel_lm is not None:
+            frame = frame.copy()
+            draw_pose_landmarks_on_frame(frame, pixel_lm, self.joint_visibility)
+
+        frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        fh, fw = rgb.shape[:2]
+        scale = min(cw / fw, ch / fh)
+        nw, nh = int(fw * scale), int(fh * scale)
+        rgb = cv2.resize(rgb, (nw, nh), interpolation=cv2.INTER_AREA)
+        img = ImageTk.PhotoImage(Image.fromarray(rgb))
+        canvas._img = img
+        canvas.create_image((cw - nw) // 2, (ch - nh) // 2, anchor='nw', image=img)
+
+    def _redraw_markup_graph(self):
+        ax = self._markup_ax
+        ax.cla()
+        ax.set_facecolor(BG_PLOT)
+        for spine in ax.spines.values():
+            spine.set_color(BG2)
+        ax.tick_params(colors=SUBTEXT, labelsize=7)
+        ax.xaxis.label.set_color(SUBTEXT)
+
+        vi = self._marking_video_idx
+        if not self.datasets or vi >= len(self.datasets):
+            self._markup_mpl_canvas.draw_idle()
+            return
+        ds  = self.datasets[vi]
+        ad  = ds.get('angle_data')
+        if ad is None or ad.empty:
+            self._markup_mpl_canvas.draw_idle()
+            return
+
+        frames = ad['frame_num'].values
+        for joint, col in JOINT_COLORS_MPL.items():
+            if joint not in ad.columns:
+                continue
+            if not self.joint_visibility.get(joint, True):
+                continue
+            ax.plot(frames, ad[joint].values, color=col, lw=1.0, alpha=0.8)
+
+        # draw the confirmed step markers for the current side
+        side = self._marking_phase
+        if side:
+            fn_set = set(int(f) for f in frames)
+            for f, s in ds.get('step_frames', []):
+                if s == side and int(f) in fn_set:
+                    mc = C_LEFT if s == 'left' else C_RIGHT
+                    ax.axvline(int(f), color=mc, lw=1.5, alpha=0.9, zorder=5)
+
+        # draw the current frame cursor
+        if self.current_frame_idx < len(ad):
+            cf = int(ad['frame_num'].iloc[self.current_frame_idx])
+            ax.axvline(cf, color=C_CURSOR, lw=1.5, linestyle='--', zorder=10)
+
+        ax.set_xlim(frames[0], frames[-1])
+        ax.set_xlabel('Frame', fontsize=7, color=SUBTEXT)
+        ax.set_ylabel('°', fontsize=7, color=SUBTEXT)
+        self._markup_fig.subplots_adjust(left=0.03, right=0.99, top=0.92, bottom=0.28)
+        self._markup_mpl_canvas.draw_idle()
+
+    def _on_markup_graph_click(self, event):
+        if event.button == 1 and event.inaxes == self._markup_ax:
+            self._markup_graph_dragging = True
+            self._markup_seek_from_event(event)
+
+    def _on_markup_graph_drag(self, event):
+        if self._markup_graph_dragging and event.inaxes == self._markup_ax:
+            self._markup_seek_from_event(event)
+
+    def _on_markup_graph_release(self, event):
+        if event.button == 1:
+            self._markup_graph_dragging = False
+
+    def _markup_seek_from_event(self, event):
+        if event.xdata is None:
+            return
+        vi = self._marking_video_idx
+        if not self.datasets or vi >= len(self.datasets):
+            return
+        ad = self.datasets[vi].get('angle_data')
+        if ad is None or ad.empty:
+            return
+        fn  = ad['frame_num'].to_numpy()
+        idx = int(np.argmin(np.abs(fn - event.xdata)))
+        self.current_frame_idx = max(0, min(idx, len(ad) - 1))
+        t = self.current_frame_idx / SLOWMO_FPS
+        self._markup_frame_lbl.config(
+            text=f"Frame {self.current_frame_idx + 1}  ({t:.2f} s)")
+        self._markup_show_frames()
+        self._redraw_markup_graph()
+
+    def _markup_add_step(self):
+        side = self._marking_phase
+        if not side or not self.datasets:
+            return
+        vi = self._marking_video_idx
+        if vi >= len(self.datasets):
+            return
+        ds = self.datasets[vi]
+        if ds and not ds['angle_data'].empty:
+            idx = min(self.current_frame_idx, len(ds['angle_data']) - 1)
+            fn = int(ds['angle_data']['frame_num'].iloc[idx])
+            ds.setdefault('step_frames', []).append((fn, side))
+            ds['step_frames'].sort(key=lambda x: x[0])
+        self._markup_count_update()
+        self._redraw_markup_graph()
+
+    def _markup_remove_last(self):
+        side = self._marking_phase
+        if not side or not self.datasets:
+            return
+        vi = self._marking_video_idx
+        if vi >= len(self.datasets):
+            return
+        ds = self.datasets[vi]
+        if ds and ds.get('step_frames'):
+            for i in range(len(ds['step_frames']) - 1, -1, -1):
+                if ds['step_frames'][i][1] == side:
+                    ds['step_frames'].pop(i)
+                    break
+        self._markup_count_update()
+        self._redraw_markup_graph()
+
+    def _markup_count_update(self):
+        side = self._marking_phase
+        if not side or self._markup_frame is None:
+            return
+        vi = self._marking_video_idx
+        if vi >= len(self.datasets):
+            return
+        ds = self.datasets[vi]
+        total = sum(1 for _, s in ds.get('step_frames', []) if s == side) if ds else 0
+        marker_col = C_LEFT if side == 'left' else C_RIGHT
+        noun = "LEFT" if side == 'left' else "RIGHT"
+        self._markup_count_lbl.config(
+            text=f"{total} {noun} step{'s' if total != 1 else ''} marked",
+            fg=marker_col)
 
     # close
     def _on_close(self):
@@ -2311,7 +2768,7 @@ class GaitAnalysisDashboard(tk.Tk):
         plt.close('all')
         self.destroy()
 
-# temp dir
+# session temp directory
 class SessionTempDir:
     def __init__(self):
         self._tmp = tempfile.TemporaryDirectory(prefix="gait_")
