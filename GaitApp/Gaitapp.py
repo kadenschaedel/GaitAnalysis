@@ -1419,7 +1419,6 @@ class GaitAnalysisDashboard(tk.Tk):
         ui_settings = _load_ui_settings()
         self.skeleton_thickness = float(ui_settings.get('skeleton_thickness', DRAW_THICKNESS))
         self.skeleton_thickness = max(0.0, min(float(DRAW_THICKNESS), self.skeleton_thickness))
-        self.auto_trim_enabled = bool(ui_settings.get('auto_trim_enabled', True))
         self.manual_step_mode     = True  # always active
         self.manual_side          = 'right'  # kept for older paths
         self.show_suggestions     = False
@@ -1723,20 +1722,6 @@ class GaitAnalysisDashboard(tk.Tk):
         for txt, cmd in buttons:
             tk.Button(bar, text=txt, command=cmd, **btn_cfg).pack(side='left', padx=2, pady=3)
 
-        self._auto_trim_var = tk.BooleanVar(value=self.auto_trim_enabled)
-        tk.Checkbutton(
-            bar,
-            text="Auto Trim",
-            variable=self._auto_trim_var,
-            command=self._toggle_auto_trim,
-            font=("Helvetica", 8),
-            bg=BG2,
-            fg=TEXT,
-            activebackground=BG2,
-            activeforeground=TEXT,
-            selectcolor=BG3,
-        ).pack(side='left', padx=(8, 2), pady=3)
-
         self._frame_lbl = tk.Label(bar, text="Frame: —",
                                    font=("Helvetica", 8), bg=BG2, fg=SUBTEXT)
         self._frame_lbl.pack(side='right', padx=8)
@@ -1976,12 +1961,8 @@ class GaitAnalysisDashboard(tk.Tk):
         return ds['angle_data'] if ds else self.angle_data
 
     def _active_max_index(self):
-        ds = self._active_ds()
         ad = self._active_angle_data()
-        if ad is None or ad.empty:
-            return -1
-        valid = self._valid_angle_indices_for_ds(ds)
-        return int(valid[-1]) if len(valid) else (len(ad) - 1)
+        return len(ad)-1 if (ad is not None and not ad.empty) else -1
 
     def _persist_dataset_markup(self, ds):
         if not ds:
@@ -2109,122 +2090,6 @@ class GaitAnalysisDashboard(tk.Tk):
                 merged.append((s, e))
         return merged
 
-    def _auto_trim_active(self):
-        return bool(self.auto_trim_enabled) and (self._marking_phase is not None or not self.show_overlaid_cycles)
-
-    def _display_angle_data_for_ds(self, ds):
-        if not ds:
-            return pd.DataFrame()
-        ad = ds.get('angle_data', pd.DataFrame())
-        if not self._auto_trim_active():
-            return ad
-        return self._get_filtered_angle_data(ad, ds.get('excluded_regions', []))
-
-    def _valid_angle_indices_for_ds(self, ds):
-        if not ds:
-            return np.array([], dtype=int)
-        ad = ds.get('angle_data', pd.DataFrame())
-        if ad is None or ad.empty:
-            return np.array([], dtype=int)
-        if not self._auto_trim_active():
-            return np.arange(len(ad), dtype=int)
-
-        frame_nums = ad['frame_num'].to_numpy(dtype=int)
-        mask = np.ones(len(frame_nums), dtype=bool)
-        for start_frame, end_frame in ds.get('excluded_regions', []):
-            mask &= ~((frame_nums >= start_frame) & (frame_nums < end_frame))
-        valid = np.flatnonzero(mask)
-        if len(valid) == 0:
-            return np.arange(len(ad), dtype=int)
-        return valid.astype(int)
-
-    def _snap_index_for_ds(self, ds, target_idx=None, direction=0):
-        ad = ds.get('angle_data', pd.DataFrame()) if ds else pd.DataFrame()
-        if ad is None or ad.empty:
-            return 0
-        if target_idx is None:
-            target_idx = self.current_frame_idx
-        target_idx = max(0, min(int(target_idx), len(ad) - 1))
-
-        valid = self._valid_angle_indices_for_ds(ds)
-        if len(valid) == 0:
-            return target_idx
-
-        if direction > 0:
-            cand = valid[valid >= target_idx]
-            return int(cand[0] if len(cand) else valid[-1])
-        if direction < 0:
-            cand = valid[valid <= target_idx]
-            return int(cand[-1] if len(cand) else valid[0])
-        return int(valid[np.argmin(np.abs(valid - target_idx))])
-
-    def _get_data_segments_for_plotting(self, ad_filtered):
-        """split filtered data into segments at frame number discontinuities when there are exclusions"""
-        if ad_filtered is None or ad_filtered.empty:
-            return [(0, -1)]
-        
-        frame_nums = ad_filtered['frame_num'].to_numpy(dtype=int)
-        if len(frame_nums) <= 1:
-            return [(0, len(frame_nums) - 1)]
-        
-        segments = []
-        start = 0
-        for i in range(1, len(frame_nums)):
-            if frame_nums[i] - frame_nums[i-1] > 1:
-                segments.append((start, i - 1))
-                start = i
-        segments.append((start, len(frame_nums) - 1))
-        return segments
-
-    def _display_frame_nums_for_ds(self, ds):
-        ad = self._display_angle_data_for_ds(ds)
-        if ad is None or ad.empty:
-            return np.array([], dtype=int)
-        return ad['frame_num'].to_numpy(dtype=int)
-
-    def _display_x_to_frame_num(self, ds, xdata):
-        frame_nums = self._display_frame_nums_for_ds(ds)
-        if len(frame_nums) == 0:
-            return None
-        if self._auto_trim_active():
-            idx = max(0, min(int(round(float(xdata))), len(frame_nums) - 1))
-            return int(frame_nums[idx])
-        idx = int(np.argmin(np.abs(frame_nums - xdata)))
-        return int(frame_nums[idx])
-
-    def _frame_num_to_angle_index(self, ds, frame_num):
-        ad = ds.get('angle_data', pd.DataFrame()) if ds else pd.DataFrame()
-        if ad is None or ad.empty:
-            return 0
-        fn = ad['frame_num'].to_numpy(dtype=int)
-        idx = int(np.argmin(np.abs(fn - int(frame_num))))
-        return idx
-
-    def _frame_num_to_display_x(self, ds, frame_num):
-        frame_nums = self._display_frame_nums_for_ds(ds)
-        if len(frame_nums) == 0:
-            return None
-        idx = int(np.argmin(np.abs(frame_nums - int(frame_num))))
-        return idx if self._auto_trim_active() else int(frame_nums[idx])
-
-    def _toggle_auto_trim(self):
-        self.auto_trim_enabled = bool(self._auto_trim_var.get())
-        _save_ui_settings({
-            'skeleton_thickness': self.skeleton_thickness,
-            'auto_trim_enabled': self.auto_trim_enabled,
-        })
-        ds = self.datasets[self._marking_video_idx] if self._marking_phase and self._marking_video_idx < len(self.datasets) else self._active_ds()
-        if ds:
-            self.current_frame_idx = self._snap_index_for_ds(ds, self.current_frame_idx, direction=0)
-        if self._marking_phase:
-            self._markup_show_frames()
-            self._redraw_markup_graph()
-        else:
-            self.redraw_graph()
-            self._reset_zoom()
-            self._show_video_frames()
-        self._update_status()
-
     # graph
     def redraw_graph(self):
         ax = self._ax
@@ -2305,28 +2170,24 @@ class GaitAnalysisDashboard(tk.Tk):
             ax.set_xlabel('Frame', fontsize=10)
             ax.set_ylabel('Angle (°)', fontsize=10)
             plotted = False
-            max_display_len = 0
 
             for ds in dfg:
                 ad  = ds['angle_data']
                 excluded = ds.get('excluded_regions', [])
-                ad_filtered = self._display_angle_data_for_ds(ds)
+                ad_filtered = self._get_filtered_angle_data(ad, excluded)
                 
                 sf  = ds.get('step_frames', [])
                 si  = _src_idx(ds)
                 ls  = linestyles[si % 2]
-                frames = np.arange(len(ad_filtered)) if self._auto_trim_active() else ad['frame_num'].values
-                max_display_len = max(max_display_len, len(frames))
 
-                if not self._auto_trim_active():
-                    for start_frame, end_frame in excluded:
-                        ax.axvspan(start_frame, end_frame, alpha=0.10, color='darkgray', zorder=1)
+                for start_frame, end_frame in excluded:
+                    ax.axvspan(start_frame, end_frame, alpha=0.10, color='darkgray', zorder=1)
 
                 # build an exclusion mask for this dataset
-                raw_frames = ad['frame_num'].values
-                excl_mask = np.zeros(len(raw_frames), dtype=bool)
+                frames = ad['frame_num'].values
+                excl_mask = np.zeros(len(frames), dtype=bool)
                 for ex_s, ex_e in excluded:
-                    excl_mask |= (raw_frames >= ex_s) & (raw_frames < ex_e)
+                    excl_mask |= (frames >= ex_s) & (frames < ex_e)
 
                 for joint, col in JOINT_COLORS_MPL.items():
                     if joint not in ad.columns:
@@ -2334,12 +2195,9 @@ class GaitAnalysisDashboard(tk.Tk):
                     vis = self.joint_visibility.get(joint, True)
                     if not vis:
                         continue
-                    if self._auto_trim_active():
-                        values = ad_filtered[joint].values.copy().astype(float)
-                    else:
-                        values = ad[joint].values.copy().astype(float)
+                    values = ad[joint].values.copy().astype(float)
 
-                    if excluded and not self._auto_trim_active():
+                    if excluded:
                         # draw excluded segments in gray
                         gray_vals = values.copy()
                         gray_vals[~excl_mask] = np.nan
@@ -2347,32 +2205,20 @@ class GaitAnalysisDashboard(tk.Tk):
                                 alpha=0.5, linestyle=ls, zorder=2)
 
                     # draw the remaining data in the joint color
-                    if self._auto_trim_active():
-                        segments = self._get_data_segments_for_plotting(ad_filtered)
-                        for start_idx, end_idx in segments:
-                            seg_x = np.arange(start_idx, end_idx + 1)
-                            seg_y = values[start_idx:end_idx + 1]
-                            ax.plot(seg_x, seg_y, color=col, lw=1.4,
-                                    alpha=0.85, linestyle=ls, zorder=3,
-                                    label=f"{joint.replace('_',' ').title()} V{si+1}" if start_idx == segments[0][0] else '')
-                    else:
-                        clean_vals = values.copy()
+                    clean_vals = values.copy()
+                    if excluded:
                         clean_vals[excl_mask] = np.nan
-                        ax.plot(frames, clean_vals, color=col, lw=1.4,
-                                alpha=0.85, linestyle=ls, zorder=3,
-                                label=f"{joint.replace('_',' ').title()} V{si+1}")
+                    ax.plot(frames, clean_vals, color=col, lw=1.4,
+                            alpha=0.85, linestyle=ls, zorder=3,
+                            label=f"{joint.replace('_',' ').title()} V{si+1}")
                     plotted = True
 
                 nsteps  = _to_fnums(ad_filtered, sf)
-                display_lookup = {int(fn): idx for idx, fn in enumerate(ad_filtered['frame_num'].to_numpy(dtype=int))}
-                fn_min  = int(ad_filtered['frame_num'].min()) if not ad_filtered.empty else 0
-                fn_max  = int(ad_filtered['frame_num'].max()) if not ad_filtered.empty else 0
+                fn_min  = int(ad['frame_num'].min())
+                fn_max  = int(ad['frame_num'].max())
                 for f, side in nsteps:
                     if fn_min <= f <= fn_max:
-                        xpos = display_lookup.get(int(f), f if not self._auto_trim_active() else None)
-                        if xpos is None:
-                            continue
-                        ax.axvline(xpos, color=C_RIGHT if side=='right' else C_LEFT,
+                        ax.axvline(f, color=C_RIGHT if side=='right' else C_LEFT,
                                    lw=0.8, alpha=0.7, linestyle=ls)
 
                 # draw suggested steps when enabled
@@ -2385,8 +2231,8 @@ class GaitAnalysisDashboard(tk.Tk):
                         y_min, y_max = ax.get_ylim()
                         y_position = y_max - (y_max - y_min) * 0.05
                         
-                        left_frames = [display_lookup[f] for f, side in suggested if side == 'left' and f in display_lookup]
-                        right_frames = [display_lookup[f] for f, side in suggested if side == 'right' and f in display_lookup]
+                        left_frames = [f for f, side in suggested if side == 'left' and fn_min <= f <= fn_max]
+                        right_frames = [f for f, side in suggested if side == 'right' and fn_min <= f <= fn_max]
                         
                         if left_frames:
                             ax.scatter(left_frames, [y_position] * len(left_frames), 
@@ -2399,9 +2245,7 @@ class GaitAnalysisDashboard(tk.Tk):
             ref_ad = ref_ds['angle_data'] if ref_ds else self.angle_data
             if ref_ad is not None and not ref_ad.empty and self.current_frame_idx < len(ref_ad):
                 cf = ref_ad['frame_num'].iloc[self.current_frame_idx]
-                cx = self._frame_num_to_display_x(ref_ds, cf) if ref_ds else cf
-                if cx is not None:
-                    ax.axvline(cx, color=C_CURSOR, lw=1.5, linestyle='--', zorder=10)
+                ax.axvline(cf, color=C_CURSOR, lw=1.5, linestyle='--', zorder=10)
 
             # add a time axis on top
             def f2s(x): return x / SLOWMO_FPS
@@ -2489,8 +2333,6 @@ class GaitAnalysisDashboard(tk.Tk):
         if self.show_overlaid_cycles:
             # overlaid cycles use the longest actual stride
             ax.set_xlim(0, self._current_max_cycle_length)
-        elif self._auto_trim_active():
-            ax.set_xlim(0, max(1, max_display_len - 1))
         elif self._ax_xlim_full is not None:
             # continuous view uses the frame range
             ax.set_xlim(self._ax_xlim_full)
@@ -2512,18 +2354,15 @@ class GaitAnalysisDashboard(tk.Tk):
             if vi < len(self.datasets):
                 store = self.datasets[vi].get('all_landmarks', [])
                 entry = None
-                frame_idx = self.current_frame_idx
-                if self._auto_trim_active():
-                    frame_idx = self._snap_index_for_ds(self.datasets[vi], frame_idx, direction=0)
-                if 0 <= frame_idx < len(store):
-                    entry = store[frame_idx]
+                if 0 <= self.current_frame_idx < len(store):
+                    entry = store[self.current_frame_idx]
                 # current format stores a raw path plus pixel landmarks
                 if isinstance(entry, tuple):
-                    frame = self._cache.get(vi, frame_idx, store)
+                    frame = self._cache.get(vi, self.current_frame_idx, store)
                     pixel_lm = entry[1]
                 else:
                     # older data may store a frame path or array directly
-                    frame = self._cache.get(vi, frame_idx, store)
+                    frame = self._cache.get(vi, self.current_frame_idx, store)
 
             canvas.delete('all')
             if frame is None:
@@ -2570,10 +2409,8 @@ class GaitAnalysisDashboard(tk.Tk):
         self._update_status()
 
     def _update_status(self):
-        ds = self._active_ds()
         ad = self._active_angle_data()
-        display_ad = self._display_angle_data_for_ds(ds) if ds else ad
-        n  = len(display_ad) if (display_ad is not None and not display_ad.empty) else 0
+        n  = len(ad) if (ad is not None and not ad.empty) else 0
         t  = self.current_frame_idx / SLOWMO_FPS
         self._frame_lbl.config(
             text=f"Frame {self.current_frame_idx+1}/{n or '?'}  ({t:.2f} s)")
@@ -2606,15 +2443,11 @@ class GaitAnalysisDashboard(tk.Tk):
 
     # graph mouse
     def _seek_from_event(self, event):
-        ds = self._active_ds()
         ad = self._active_angle_data()
-        if ds is None or ad is None or ad.empty or event.xdata is None:
-            return
-        frame_num = self._display_x_to_frame_num(ds, event.xdata)
-        if frame_num is None:
-            return
-        idx = self._frame_num_to_angle_index(ds, frame_num)
-        self.current_frame_idx = self._snap_index_for_ds(ds, idx, direction=0)
+        if ad is None or ad.empty or event.xdata is None: return
+        fn  = ad['frame_num'].to_numpy()
+        idx = int(np.argmin(np.abs(fn - event.xdata)))
+        self.current_frame_idx = max(0, min(idx, len(ad)-1))
         # preserve zoom while scrubbing
         current_xlim = self._ax.get_xlim()
         self._show_video_frames()
@@ -2667,13 +2500,7 @@ class GaitAnalysisDashboard(tk.Tk):
                     # apply the exclusion to each selected dataset
                     for target_ds in target_datasets:
                         if target_ds:
-                            mapped_start = self._display_x_to_frame_num(target_ds, start_frame)
-                            mapped_end = self._display_x_to_frame_num(target_ds, end_frame)
-                            if mapped_start is None or mapped_end is None:
-                                continue
-                            if mapped_start > mapped_end:
-                                mapped_start, mapped_end = mapped_end, mapped_start
-                            target_ds.setdefault('excluded_regions', []).append((mapped_start, mapped_end))
+                            target_ds.setdefault('excluded_regions', []).append((start_frame, end_frame))
                             target_ds['excluded_regions'] = self._merge_exclusion_regions(
                                 target_ds['excluded_regions'])
                             self._persist_dataset_markup(target_ds)
@@ -2798,21 +2625,6 @@ class GaitAnalysisDashboard(tk.Tk):
     def _get_current_xlim_full(self):
         if self.show_overlaid_cycles:
             return (0, getattr(self, '_current_max_cycle_length', self.resample_length))
-        if self._auto_trim_active():
-            datasets = self.datasets or [{'angle_data': self.angle_data, 'step_frames': []}]
-            if len(datasets) >= 2:
-                if self.graph_show_mode == 'v1':
-                    dfg = [datasets[0]]
-                elif self.graph_show_mode == 'v2':
-                    dfg = [datasets[1]]
-                else:
-                    dfg = datasets[:2]
-            else:
-                dfg = datasets[:1]
-            max_len = 0
-            for ds in dfg:
-                max_len = max(max_len, len(self._display_angle_data_for_ds(ds)))
-            return (0, max(1, max_len - 1))
         return self._ax_xlim_full or (0, 100)
     
     def _update_scrollbar(self):
@@ -2823,9 +2635,6 @@ class GaitAnalysisDashboard(tk.Tk):
         cur_xlim = self._ax.get_xlim()
         full_min, full_max = xlim_full
         full_range = full_max - full_min
-        if full_range <= 0:
-            self._graph_hbar.set(0, 1)
-            return
         
         # calculate the scrollbar thumb position
         first = (cur_xlim[0] - full_min) / full_range
@@ -2845,8 +2654,6 @@ class GaitAnalysisDashboard(tk.Tk):
         
         full_min, full_max = xlim_full
         full_range = full_max - full_min
-        if full_range <= 0:
-            return
         cur_width = self._ax.get_xlim()[1] - self._ax.get_xlim()[0]
         
         # parse the tkinter scrollbar callback arguments
@@ -2883,11 +2690,8 @@ class GaitAnalysisDashboard(tk.Tk):
     # playback
     def _play_tick(self):
         if not self.playing: return
-        next_idx = self.current_frame_idx + 1
-        if self._auto_trim_active():
-            next_idx = self._snap_index_for_ds(self._active_ds(), next_idx, direction=1)
-        if next_idx > self.current_frame_idx and next_idx <= self._active_max_index():
-            self.current_frame_idx = next_idx
+        if self.current_frame_idx < self._active_max_index():
+            self.current_frame_idx += 1
             # preserve zoom during playback
             current_xlim = self._ax.get_xlim()
             self._show_video_frames()
@@ -2904,22 +2708,14 @@ class GaitAnalysisDashboard(tk.Tk):
     # controls
     def _prev_frame(self):
         if self.playing: return
+        self.current_frame_idx = max(0, self.current_frame_idx - 1)
         if self._marking_phase:
-            vi = self._marking_video_idx
-            if self._auto_trim_active() and vi < len(self.datasets):
-                self.current_frame_idx = self._snap_index_for_ds(self.datasets[vi], self.current_frame_idx - 1, direction=-1)
-            else:
-                self.current_frame_idx = max(0, self.current_frame_idx - 1)
             t = self.current_frame_idx / SLOWMO_FPS
             self._markup_frame_lbl.config(
                 text=f"Frame {self.current_frame_idx + 1}  ({t:.2f} s)")
             self._markup_show_frames()
             self._redraw_markup_graph()
             return
-        if self._auto_trim_active() and not self._marking_phase:
-            self.current_frame_idx = self._snap_index_for_ds(self._active_ds(), self.current_frame_idx - 1, direction=-1)
-        else:
-            self.current_frame_idx = max(0, self.current_frame_idx - 1)
 
         # preserve zoom
         current_xlim = self._ax.get_xlim()
@@ -2935,20 +2731,14 @@ class GaitAnalysisDashboard(tk.Tk):
             vi = self._marking_video_idx
             max_idx = (len(self.datasets[vi].get('all_landmarks', [])) - 1
                        if vi < len(self.datasets) else self._active_max_index())
-            if self._auto_trim_active() and vi < len(self.datasets):
-                self.current_frame_idx = self._snap_index_for_ds(self.datasets[vi], self.current_frame_idx + 1, direction=1)
-            else:
-                self.current_frame_idx = min(max_idx, self.current_frame_idx + 1)
+            self.current_frame_idx = min(max_idx, self.current_frame_idx + 1)
             t = self.current_frame_idx / SLOWMO_FPS
             self._markup_frame_lbl.config(
                 text=f"Frame {self.current_frame_idx + 1}  ({t:.2f} s)")
             self._markup_show_frames()
             self._redraw_markup_graph()
             return
-        if self._auto_trim_active():
-            self.current_frame_idx = self._snap_index_for_ds(self._active_ds(), self.current_frame_idx + 1, direction=1)
-        else:
-            self.current_frame_idx = min(self._active_max_index(), self.current_frame_idx + 1)
+        self.current_frame_idx = min(self._active_max_index(), self.current_frame_idx + 1)
         # preserve zoom
         current_xlim = self._ax.get_xlim()
         self._show_video_frames()
@@ -3085,7 +2875,6 @@ class GaitAnalysisDashboard(tk.Tk):
     def _toggle_active(self):
         if len(self.datasets) >= 2:
             self.active_dataset_idx = 1 - self.active_dataset_idx
-            self.current_frame_idx = self._snap_index_for_ds(self._active_ds(), self.current_frame_idx, direction=0)
             self._status_msg.set(f"Active: V{self.active_dataset_idx+1}")
             self._show_video_frames()
             self.redraw_graph()
@@ -3134,10 +2923,7 @@ class GaitAnalysisDashboard(tk.Tk):
             self.skeleton_thickness = max(0.0, min(float(DRAW_THICKNESS), float(value)))
         except Exception:
             return
-        _save_ui_settings({
-            'skeleton_thickness': self.skeleton_thickness,
-            'auto_trim_enabled': self.auto_trim_enabled,
-        })
+        _save_ui_settings({'skeleton_thickness': self.skeleton_thickness})
         if self._marking_phase:
             self._markup_show_frames()
         else:
@@ -3314,9 +3100,12 @@ class GaitAnalysisDashboard(tk.Tk):
                                    parent=self)
             return
 
+        for ds in self.datasets:
+            if ds:
+                ds['step_frames'] = []
+                self._persist_dataset_markup(ds)
+
         self._markup_required_videos = [True] * len(self.datasets)
-        self.show_overlaid_cycles = False
-        self.resample_cycles = False
 
         self.playing = False
         if self._play_after_id:
@@ -3432,8 +3221,6 @@ class GaitAnalysisDashboard(tk.Tk):
         ).pack(side='left', padx=8)
 
     def _enter_marking_phase(self, side, video_idx):
-        self.show_overlaid_cycles = False
-        self.resample_cycles = False
         self._marking_phase = side
         self._marking_video_idx = video_idx
 
@@ -3441,10 +3228,8 @@ class GaitAnalysisDashboard(tk.Tk):
             self._build_markup_screen()
 
         self.current_frame_idx = 2
-        if video_idx < len(self.datasets):
-            self.current_frame_idx = self._snap_index_for_ds(self.datasets[video_idx], self.current_frame_idx, direction=1)
-        t0 = self.current_frame_idx / SLOWMO_FPS
-        self._markup_frame_lbl.config(text=f"Frame {self.current_frame_idx + 1}  ({t0:.2f} s)")
+        t0 = 2 / SLOWMO_FPS
+        self._markup_frame_lbl.config(text=f"Frame 3  ({t0:.2f} s)")
 
         phase_order = [(s, vi) for s, vi in [('left', 0), ('left', 1), ('right', 0), ('right', 1)]
                        if self._dataset_needs_markup(vi)]
@@ -3567,60 +3352,47 @@ class GaitAnalysisDashboard(tk.Tk):
             self._markup_mpl_canvas.draw_idle()
             return
 
-        display_ad = self._display_angle_data_for_ds(ds)
-        if display_ad is None or display_ad.empty:
-            self._markup_mpl_canvas.draw_idle()
-            return
-
-        frames = np.arange(len(display_ad), dtype=int) if self._auto_trim_active() else ad['frame_num'].values
+        frames = ad['frame_num'].values
         excluded = ds.get('excluded_regions', [])
-        display_lookup = {int(fn): idx for idx, fn in enumerate(display_ad['frame_num'].to_numpy(dtype=int))}
 
-        raw_frames = ad['frame_num'].values
-        excl_mask = np.zeros(len(raw_frames), dtype=bool)
+        excl_mask = np.zeros(len(frames), dtype=bool)
         for start_frame, end_frame in excluded:
-            excl_mask |= (raw_frames >= start_frame) & (raw_frames < end_frame)
+            excl_mask |= (frames >= start_frame) & (frames < end_frame)
 
-        if not self._auto_trim_active():
-            # shade excluded windows to match the main graph behavior
-            for start_frame, end_frame in excluded:
-                ax.axvspan(start_frame, end_frame, alpha=0.18, color='#6e6e6e', zorder=1)
+        # shade excluded windows to match the main graph behavior
+        for start_frame, end_frame in excluded:
+            ax.axvspan(start_frame, end_frame, alpha=0.18, color='#6e6e6e', zorder=1)
 
         for joint, col in JOINT_COLORS_MPL.items():
             if joint not in ad.columns:
                 continue
             if not self.joint_visibility.get(joint, True):
                 continue
-            vals = display_ad[joint].values.astype(float) if self._auto_trim_active() else ad[joint].values.astype(float)
-            if excluded and not self._auto_trim_active():
+            vals = ad[joint].values.astype(float)
+            if excluded:
                 gray_vals = vals.copy()
                 gray_vals[~excl_mask] = np.nan
                 ax.plot(frames, gray_vals, color='#7a7a7a', lw=1.2, alpha=0.9, zorder=2)
             clean_vals = vals.copy()
-            if excluded and not self._auto_trim_active():
-                clean_vals[excl_mask] = np.nan
+            clean_vals[excl_mask] = np.nan
             ax.plot(frames, clean_vals, color=col, lw=1.0, alpha=0.85, zorder=3)
 
         # draw the confirmed step markers for the current side
         side = self._marking_phase
         if side:
-            fn_set = set(int(f) for f in display_ad['frame_num'].to_numpy(dtype=int))
+            fn_set = set(int(f) for f in frames)
             for f, s in ds.get('step_frames', []):
                 if s == side and int(f) in fn_set:
                     mc = C_LEFT if s == 'left' else C_RIGHT
-                    xpos = display_lookup.get(int(f), int(f) if not self._auto_trim_active() else None)
-                    if xpos is not None:
-                        ax.axvline(xpos, color=mc, lw=1.5, alpha=0.9, zorder=5)
+                    ax.axvline(int(f), color=mc, lw=1.5, alpha=0.9, zorder=5)
 
         # draw the current frame cursor
         if self.current_frame_idx < len(ad):
             cf = int(ad['frame_num'].iloc[self.current_frame_idx])
-            cx = self._frame_num_to_display_x(ds, cf)
-            if cx is not None:
-                ax.axvline(cx, color=C_CURSOR, lw=1.5, linestyle='--', zorder=10)
+            ax.axvline(cf, color=C_CURSOR, lw=1.5, linestyle='--', zorder=10)
 
         ax.set_xlim(frames[0], frames[-1])
-        ax.set_xlabel('Frame' if not self._auto_trim_active() else 'Trimmed Frame', fontsize=7, color=SUBTEXT)
+        ax.set_xlabel('Frame', fontsize=7, color=SUBTEXT)
         ax.set_ylabel('°', fontsize=7, color=SUBTEXT)
         self._markup_fig.subplots_adjust(left=0.03, right=0.99, top=0.92, bottom=0.28)
         self._markup_mpl_canvas.draw_idle()
@@ -3647,11 +3419,9 @@ class GaitAnalysisDashboard(tk.Tk):
         ad = self.datasets[vi].get('angle_data')
         if ad is None or ad.empty:
             return
-        frame_num = self._display_x_to_frame_num(self.datasets[vi], event.xdata)
-        if frame_num is None:
-            return
-        idx = self._frame_num_to_angle_index(self.datasets[vi], frame_num)
-        self.current_frame_idx = self._snap_index_for_ds(self.datasets[vi], idx, direction=0)
+        fn  = ad['frame_num'].to_numpy()
+        idx = int(np.argmin(np.abs(fn - event.xdata)))
+        self.current_frame_idx = max(0, min(idx, len(ad) - 1))
         t = self.current_frame_idx / SLOWMO_FPS
         self._markup_frame_lbl.config(
             text=f"Frame {self.current_frame_idx + 1}  ({t:.2f} s)")
