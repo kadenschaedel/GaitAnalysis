@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import pickle
+import shutil
 import signal
 import sys
 import tempfile
@@ -85,6 +86,22 @@ def _cache_root_dir():
 
 def _cache_dir(cache_key):
     return os.path.join(_cache_root_dir(), cache_key)
+
+
+def _butterworth_lowpass(cutoff, fs, order=4):
+    """Design a low-pass Butterworth filter."""
+    nyquist = fs / 2.0
+    normal_cutoff = cutoff / nyquist
+    b, a = butter(order, normal_cutoff, btype='low', analog=False)
+    return b, a
+
+
+def _butterworth_lowpass_filter(data, cutoff=6, fs=240, order=4):
+    """Apply a low-pass Butterworth filter to smooth data."""
+    if len(data) < order + 1:
+        return data
+    b, a = _butterworth_lowpass(cutoff, fs, order=order)
+    return filtfilt(b, a, data)
 
 
 def _video_metadata(video_path):
@@ -542,13 +559,6 @@ def detect_crop_region(video_path, needs_rotation, sample_count=10):
         return None  # borders are too small to crop
 
     return (x_min, y_min, cw, ch)
-
-
-def butter_lowpass_filter(data, cutoff=4.0, fs=240.0, order=4):
-    # apply a butterworth low pass filter
-    nyq  = 0.5 * fs
-    b, a = butter(order, cutoff/nyq, btype='low', analog=False)
-    return filtfilt(b, a, data)
 
 
 def pct_change(new, old):
@@ -1024,11 +1034,15 @@ def process_video(video_path, ann_dir, progress_cb, status_cb,
     if cache_key:
         cached = _load_cached_video_result(cache_key)
         if cached is not None:
-            cached['_cache_key'] = cache_key
-            cached['_cache_meta'] = cache_meta or {}
-            cached['_cached_markup'] = cached_markup
-            status_cb("Loaded cached analysis")
-            return cached
+            # Check if cached data is missing confidence_data; if so, reprocess to add it
+            if cached.get('confidence_data') is None or cached['confidence_data'].empty:
+                status_cb("Cached data missing confidence scores - reprocessing...")
+            else:
+                cached['_cache_key'] = cache_key
+                cached['_cache_meta'] = cache_meta or {}
+                cached['_cached_markup'] = cached_markup
+                status_cb("Loaded cached analysis")
+                return cached
 
     if needs_rotation is None:
         status_cb("Detecting subject orientation…")
@@ -1071,7 +1085,7 @@ def process_video(video_path, ann_dir, progress_cb, status_cb,
         output_segmentation_masks=False)
     landmarker = PoseLandmarker.create_from_options(opts)
 
-    world_rows, pixel_rows, landmarks, landmark_depths = [], [], [], []
+    world_rows, pixel_rows, landmarks, landmark_depths, confidence_rows = [], [], [], [], []
     frame_count = 0
 
     frame_output_dir = ann_dir
@@ -1190,11 +1204,21 @@ def process_video(video_path, ann_dir, progress_cb, status_cb,
                 depth_row[f'joint_{i}'] = landmark.z
             landmark_depths.append(depth_row)
 
+            # track confidence/visibility scores
+            conf_row = {'frame_num': frame_count}
+            if pixel_lm:
+                visibilities = [lm.visibility for lm in pixel_lm]
+                conf_row['avg_confidence'] = float(np.mean(visibilities))
+            else:
+                conf_row['avg_confidence'] = 0.0
+            confidence_rows.append(conf_row)
+
             world_rows.append(w_row)
             pixel_rows.append(p_row)
         else:
             landmarks.append(None)
             landmark_depths.append(None)
+            confidence_rows.append({'frame_num': frame_count, 'avg_confidence': 0.0})
 
     cap.release()
     landmarker.close()
@@ -1202,6 +1226,7 @@ def process_video(video_path, ann_dir, progress_cb, status_cb,
     df_w = pd.DataFrame(world_rows)
     df_p = pd.DataFrame(pixel_rows)
     df_depths = pd.DataFrame([d for d in landmark_depths if d is not None])
+    df_confidence = pd.DataFrame(confidence_rows)
 
     # diagnostics are noisy and slow, keep them opt-in only
     if DEBUG_DIRECTION_DIAGNOSTICS:
@@ -1214,8 +1239,26 @@ def process_video(video_path, ann_dir, progress_cb, status_cb,
     for df in (df_w, df_p):
         for col in df.columns:
             if col not in ('frame_num', '_direction'):
-                df[col] = butter_lowpass_filter(df[col], FILTER_CUTOFF, SLOWMO_FPS, FILTER_ORDER)
                 df[col] = df[col].astype(np.float32)
+    
+    # apply butterworth low-pass filter to smooth joint angles
+    joint_cols = set()
+    for df in (df_w, df_p):
+        for col in df.columns:
+            if col not in ('frame_num', '_direction'):
+                joint_cols.add(col)
+    
+    for df in (df_w, df_p):
+        for col in joint_cols:
+            if col in df.columns and len(df) > FILTER_ORDER:
+                try:
+                    df[col] = _butterworth_lowpass_filter(df[col].values, FILTER_CUTOFF, SLOWMO_FPS, FILTER_ORDER)
+                except Exception:
+                    pass  # if filtering fails, keep original data
+    
+    #apply same filtering to confidence data
+    if 'avg_confidence' in df_confidence.columns:
+        df_confidence['avg_confidence'] = df_confidence['avg_confidence'].astype(np.float32)
 
     # drop the helper direction column before returning data
     for df in (df_w, df_p):
@@ -1231,6 +1274,7 @@ def process_video(video_path, ann_dir, progress_cb, status_cb,
         'df_world':       df_w,
         'df_pixel':       df_p,
         'angle_data':     ad,
+        'confidence_data': df_confidence,
         'step_frames':    [],
         # 'suggested_step_frames': suggested_steps,
         'excluded_regions': [],
@@ -1383,6 +1427,328 @@ HELP_TEXT = [
     ("h / H",         "This help screen"),
 ]
 
+# cache manager dialog
+class CacheManagerDialog(tk.Toplevel):
+    """Dialog to view and manage all cached videos."""
+    
+    def __init__(self, parent, cache_root):
+        super().__init__(parent)
+        self.title("Cache Manager")
+        self.geometry("700x500")
+        self.cache_root = cache_root
+        self.caches_info = []
+        self.cache_vars = {}
+        
+        self._build_ui()
+        self._scan_caches()
+    
+    def _build_ui(self):
+        """Build the cache manager UI."""
+        # Canvas with scrollbar
+        canvas_frame = tk.Frame(self, bg=BG)
+        canvas_frame.pack(fill='both', expand=True, padx=10, pady=10)
+        
+        canvas = tk.Canvas(canvas_frame, bg=BG, highlightthickness=0)
+        scrollbar = tk.Scrollbar(canvas_frame, orient='vertical', command=canvas.yview)
+        scrollable = tk.Frame(canvas, bg=BG)
+        scrollable.bind('<Configure>', lambda e: canvas.configure(scrollregion=canvas.bbox('all')))
+        canvas.create_window((0, 0), window=scrollable, anchor='nw')
+        canvas.configure(yscrollcommand=scrollbar.set)
+        
+        canvas.pack(side='left', fill='both', expand=True)
+        scrollbar.pack(side='right', fill='y')
+        
+        self.scrollable_frame = scrollable
+    
+    def _scan_caches(self):
+        """Scan cache directory and populate the list."""
+        if not os.path.exists(self.cache_root):
+            tk.Label(self.scrollable_frame, text="No cache directory found",
+                    font=("Helvetica", 10), bg=BG, fg=SUBTEXT).pack(pady=20)
+            return
+        
+        try:
+            cache_dirs = [d for d in os.listdir(self.cache_root) 
+                         if os.path.isdir(os.path.join(self.cache_root, d))]
+        except Exception as e:
+            tk.Label(self.scrollable_frame, text=f"Error reading cache: {e}",
+                    font=("Helvetica", 10), bg=BG, fg='#e74c3c').pack(pady=20)
+            return
+        
+        if not cache_dirs:
+            tk.Label(self.scrollable_frame, text="No cached videos found",
+                    font=("Helvetica", 10), bg=BG, fg=SUBTEXT).pack(pady=20)
+            return
+        
+        for cache_key in sorted(cache_dirs):
+            self._add_cache_entry(cache_key)
+    
+    def _add_cache_entry(self, cache_key):
+        """Add a cache entry to the list."""
+        cache_path = os.path.join(self.cache_root, cache_key)
+        
+        # Get metadata
+        meta = {}
+        manifest_path = os.path.join(cache_path, 'manifest.json')
+        if os.path.exists(manifest_path):
+            try:
+                with open(manifest_path, 'r') as f:
+                    meta = json.load(f)
+            except:
+                pass
+        
+        # Get video name from metadata, fall back to cache key
+        video_name = meta.get('video_name', f"Unknown - {cache_key[:16]}...")
+        
+        # Check what data exists
+        result_pkl = os.path.join(cache_path, 'result.pkl')
+        markup_json = os.path.join(cache_path, 'markup.json')
+        frames_dir = os.path.join(cache_path, 'frames')
+        
+        has_result = os.path.exists(result_pkl)
+        has_markup = os.path.exists(markup_json)
+        has_frames = os.path.isdir(frames_dir)
+        
+        # Get cache size
+        total_size = 0
+        try:
+            for root, dirs, files in os.walk(cache_path):
+                for f in files:
+                    total_size += os.path.getsize(os.path.join(root, f))
+        except:
+            pass
+        
+        size_str = f"{total_size / (1024*1024):.1f} MB" if total_size > 0 else "0 KB"
+        
+        # Frame for this cache entry
+        entry_frame = tk.Frame(self.scrollable_frame, bg=BG2, relief='solid', borderwidth=1)
+        entry_frame.pack(fill='x', pady=6)
+        
+        # Title with size and delete button
+        title_frame = tk.Frame(entry_frame, bg=BG2)
+        title_frame.pack(fill='x', padx=8, pady=(6, 2))
+        
+        tk.Label(title_frame, text=f"📹 {video_name}", 
+                font=("Helvetica", 10, "bold"), bg=BG2, fg=TEXT).pack(side='left')
+        tk.Label(title_frame, text=f"({size_str})",
+                font=("Helvetica", 8), bg=BG2, fg=SUBTEXT).pack(side='left', padx=(4, 0))
+        
+        # Delete whole cache button
+        delete_btn = tk.Label(title_frame, text="✕", font=("Helvetica", 12, "bold"),
+                             bg=BG2, fg='#e74c3c', cursor="hand2")
+        delete_btn.pack(side='right')
+        delete_btn.bind('<Button-1>', lambda e: self._delete_whole_cache(cache_key, cache_path, entry_frame))
+        
+        # Data info
+        data_frame = tk.Frame(entry_frame, bg=BG2)
+        data_frame.pack(fill='x', padx=20, pady=2)
+        
+        data_text = []
+        if has_result:
+            data_text.append("✓ Coordinates & Angles")
+        if has_markup:
+            data_text.append("✓ Step Marks")
+        if has_frames:
+            data_text.append("✓ Frame Cache")
+        
+        tk.Label(data_frame, text="  |  ".join(data_text) if data_text else "No data",
+                font=("Helvetica", 8), bg=BG2, fg=TEXT).pack(anchor='w')
+        
+        # Checkboxes
+        checks_frame = tk.Frame(entry_frame, bg=BG2)
+        checks_frame.pack(fill='x', padx=20, pady=(4, 6))
+        
+        vars_dict = {
+            'result': tk.BooleanVar(value=False),
+            'markup': tk.BooleanVar(value=False),
+            'frames': tk.BooleanVar(value=False),
+        }
+        
+        if has_result:
+            tk.Checkbutton(checks_frame, text="Delete Coordinates & Angles",
+                          variable=vars_dict['result'], bg=BG2, fg=TEXT,
+                          activebackground=BG2, activeforeground=TEXT).pack(anchor='w', pady=2)
+        
+        if has_markup:
+            tk.Checkbutton(checks_frame, text="Delete Step Marks",
+                          variable=vars_dict['markup'], bg=BG2, fg=TEXT,
+                          activebackground=BG2, activeforeground=TEXT).pack(anchor='w', pady=2)
+        
+        if has_frames:
+            tk.Checkbutton(checks_frame, text="Delete Cached Frames",
+                          variable=vars_dict['frames'], bg=BG2, fg=TEXT,
+                          activebackground=BG2, activeforeground=TEXT).pack(anchor='w', pady=2)
+        
+        if not (has_result or has_markup or has_frames):
+            tk.Label(checks_frame, text="(Empty cache)", font=("Helvetica", 8),
+                    bg=BG2, fg=SUBTEXT).pack(anchor='w', pady=2)
+        
+        self.caches_info.append({
+            'cache_key': cache_key,
+            'cache_path': cache_path,
+            'has_result': has_result,
+            'has_markup': has_markup,
+            'has_frames': has_frames,
+            'vars': vars_dict
+        })
+        self.cache_vars[cache_key] = vars_dict
+    
+    def _delete_whole_cache(self, cache_key, cache_path, entry_frame):
+        """Delete entire cache for a video."""
+        if not messagebox.askyesno("Confirm Delete", 
+                                   f"Delete entire cache?\n\nThis cannot be undone."):
+            return
+        
+        try:
+            if os.path.exists(cache_path):
+                shutil.rmtree(cache_path)
+            messagebox.showinfo("Success", "Cache deleted")
+            entry_frame.destroy()
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to delete cache: {e}")
+    
+    def _delete_selected(self):
+        """Delete selected cache data."""
+        to_delete = []
+        
+        for info in self.caches_info:
+            cache_key = info['cache_key']
+            cache_path = info['cache_path']
+            vars_dict = info['vars']
+            
+            items = []
+            
+            if vars_dict['result'].get() and info['has_result']:
+                result_pkl = os.path.join(cache_path, 'result.pkl')
+                items.append(('result', result_pkl))
+            
+            if vars_dict['markup'].get() and info['has_markup']:
+                markup_json = os.path.join(cache_path, 'markup.json')
+                items.append(('markup', markup_json))
+            
+            if vars_dict['frames'].get() and info['has_frames']:
+                frames_dir = os.path.join(cache_path, 'frames')
+                items.append(('frames', frames_dir))
+            
+            if items:
+                to_delete.append((cache_key, items))
+        
+        if not to_delete:
+            messagebox.showwarning("Nothing Selected", "Please select data to delete")
+            return
+        
+        # Confirm
+        count = sum(len(items) for _, items in to_delete)
+        if not messagebox.askyesno("Confirm Delete", 
+                                   f"Delete {count} item(s) from {len(to_delete)} cache(s)?\n\nThis cannot be undone."):
+            return
+        
+        # Delete
+        deleted_count = 0
+        failed = []
+        
+        for cache_key, items in to_delete:
+            for item_type, item_path in items:
+                try:
+                    if os.path.isdir(item_path):
+                        shutil.rmtree(item_path)
+                    else:
+                        os.remove(item_path)
+                    deleted_count += 1
+                except Exception as e:
+                    failed.append(f"{item_type}: {str(e)}")
+        
+        if failed:
+            msg = "Deleted " + str(deleted_count) + " items with errors:\n" + "\n".join(failed[:5])
+            messagebox.showwarning("Partial Delete", msg)
+        else:
+            messagebox.showinfo("Success", f"Deleted {deleted_count} item(s)")
+        
+        # Refresh
+        self.scrollable_frame.destroy()
+        self.scrollable_frame = tk.Frame(self, bg=BG)
+        self.scrollable_frame.pack(fill='both', expand=True, padx=10, pady=10)
+        self.caches_info = []
+        self.cache_vars = {}
+        self._scan_caches()
+
+# settings dialog
+class SettingsDialog(tk.Toplevel):
+    """Settings dialog for confidence display and cache management."""
+    
+    def __init__(self, parent, dashboard):
+        super().__init__(parent)
+        self.title("Settings")
+        self.geometry("500x300")
+        self.dashboard = dashboard
+        self.configure(bg=BG)
+        
+        self._build_ui()
+    
+    def _build_ui(self):
+        """Build the settings UI."""
+        # Title
+        title_frame = tk.Frame(self, bg=BG2, height=50)
+        title_frame.pack(fill='x', padx=0, pady=0)
+        tk.Label(title_frame, text="Settings",
+                font=("Helvetica", 12, "bold"), bg=BG2, fg=TEXT).pack(side='left', padx=10, pady=8)
+        
+        # Content frame
+        content = tk.Frame(self, bg=BG)
+        content.pack(fill='both', expand=True, padx=20, pady=20)
+        
+        # Toggle confidence option
+        conf_frame = tk.Frame(content, bg=BG)
+        conf_frame.pack(fill='x', pady=10)
+        
+        conf_label = tk.Label(conf_frame, text="Confidence Scores", 
+                             font=("Helvetica", 10), bg=BG, fg=TEXT)
+        conf_label.pack(side='left')
+        
+        conf_info = tk.Label(conf_frame, text="Toggle with Alt+C", 
+                            font=("Helvetica", 8), bg=BG, fg=SUBTEXT)
+        conf_info.pack(side='left', padx=(10, 0))
+        
+        self.conf_var = tk.BooleanVar(value=self.dashboard.show_confidence)
+        conf_check = tk.Checkbutton(conf_frame, text="Show confidence scores on graph",
+                                   variable=self.conf_var, bg=BG, fg=TEXT,
+                                   activebackground=BG, activeforeground=TEXT,
+                                   command=self._toggle_confidence)
+        conf_check.pack(side='right')
+        
+        # Separator
+        sep = tk.Frame(content, bg=BG2, height=1)
+        sep.pack(fill='x', pady=10)
+        
+        # Cache management option
+        cache_frame = tk.Frame(content, bg=BG)
+        cache_frame.pack(fill='x', pady=10)
+        
+        cache_label = tk.Label(cache_frame, text="Cache Management", 
+                              font=("Helvetica", 10), bg=BG, fg=TEXT)
+        cache_label.pack(side='left')
+        
+        tk.Button(cache_frame, text="Manage Cache", font=("Helvetica", 9),
+                 bg=BG3, fg=TEXT, relief='flat', padx=8,
+                 command=self._open_cache_manager).pack(side='right')
+        
+        # Bottom buttons
+        btn_frame = tk.Frame(self, bg=BG)
+        btn_frame.pack(fill='x', padx=20, pady=15)
+        
+        tk.Button(btn_frame, text="Close", font=("Helvetica", 10),
+                 bg=BG3, fg=TEXT, relief='flat', padx=12, pady=6,
+                 command=self.destroy).pack(side='right')
+    
+    def _toggle_confidence(self):
+        """Toggle confidence scores."""
+        self.dashboard.show_confidence = self.conf_var.get()
+        self.dashboard.redraw_graph()
+    
+    def _open_cache_manager(self):
+        """Open the cache manager dialog."""
+        CacheManagerDialog(self, _cache_root_dir())
+
 # dashboard
 class GaitAnalysisDashboard(tk.Tk):
 
@@ -1415,6 +1781,7 @@ class GaitAnalysisDashboard(tk.Tk):
         self.mean_only            = False
         self.show_normative       = True
         self.show_data            = True
+        self.show_confidence      = False  # confidence scores hidden by default
         self.active_dataset_idx   = 0
         ui_settings = _load_ui_settings()
         self.skeleton_thickness = float(ui_settings.get('skeleton_thickness', DRAW_THICKNESS))
@@ -1455,9 +1822,11 @@ class GaitAnalysisDashboard(tk.Tk):
         except FileNotFoundError:
             pass
 
-        tk.Label(hdr, text="NOVITA GAIT ANALYSIS",
+        title_label = tk.Label(hdr, text="NOVITA GAIT ANALYSIS",
                  font=("Coiny Cyrillic", 17), bg=BG2, fg=ACCENT,
-                 ).pack(side='left', pady=(6, 0))
+                 cursor="hand2")
+        title_label.pack(side='left', pady=(6, 0))
+        title_label.bind('<Button-1>', lambda e: self._open_settings())
 
         tk.Button(hdr, text="Re-mark", font=("Helvetica", 9),
               bg=BG3, fg=TEXT, relief='flat', padx=8,
@@ -1806,9 +2175,11 @@ class GaitAnalysisDashboard(tk.Tk):
                 if not info or info.get('error'):
                     continue
                 cache_keys[i] = _build_cache_key(info, target_output_size)
+                video_name = os.path.basename(video_paths[i]) if video_paths[i] else f"Video {i+1}"
                 cache_meta[i] = {
                     'schema': CACHE_SCHEMA_VERSION,
                     'video_path': video_paths[i],
+                    'video_name': video_name,
                     'video_meta': info.get('video_meta'),
                     'video_sha256': info.get('video_sha256'),
                     'target_output_size': list(target_output_size) if target_output_size else None,
@@ -1934,6 +2305,7 @@ class GaitAnalysisDashboard(tk.Tk):
         self.bind('<BackSpace>',    lambda e: self._delete_nearest_step())
         self.bind('<Delete>',       lambda e: self._delete_nearest_step())
         self.bind('z',              lambda e: self._reset_zoom())
+        self.bind('<Alt-c>',        lambda e: self._toggle_confidence())
         for k, jt in [('3','left_hip'),('4','right_hip'),('5','left_knee'),
                        ('6','right_knee'),('7','left_ankle'),('8','right_ankle')]:
             self.bind(k, lambda e, j=jt: self._toggle_joint(j))
@@ -2246,6 +2618,17 @@ class GaitAnalysisDashboard(tk.Tk):
             if ref_ad is not None and not ref_ad.empty and self.current_frame_idx < len(ref_ad):
                 cf = ref_ad['frame_num'].iloc[self.current_frame_idx]
                 ax.axvline(cf, color=C_CURSOR, lw=1.5, linestyle='--', zorder=10)
+
+            # plot confidence data on secondary y-axis (only if show_confidence is True)
+            if self.show_confidence:
+                for ds in dfg:
+                    conf_data = ds.get('confidence_data')
+                    if conf_data is not None and not conf_data.empty:
+                        frames = conf_data['frame_num'].values
+                        confidence = conf_data['avg_confidence'].values * 100  # scale to 0-100 for visibility
+                        si = _src_idx(ds)
+                        ax.plot(frames, confidence, color='#27ae60', alpha=0.35, lw=1.0,
+                                linestyle=linestyles[si % 2], label=f"Confidence (×100%) V{si+1}", zorder=1)
 
             # add a time axis on top
             def f2s(x): return x / SLOWMO_FPS
@@ -2787,6 +3170,40 @@ class GaitAnalysisDashboard(tk.Tk):
             self.mean_only = False
         self._update_display_btn_visuals()
         self.redraw_graph()
+
+    def _toggle_confidence(self):
+        self.show_confidence = not self.show_confidence
+        self._status_msg.set(f"Confidence scores {'shown' if self.show_confidence else 'hidden'}")
+        self.redraw_graph()
+
+    def _clear_current_cache(self):
+        """Clear cached coordinate/step data for currently loaded videos."""
+        if not self.datasets:
+            messagebox.showwarning("No Videos", "No videos loaded")
+            return
+        
+        cleared_count = 0
+        for i, ds in enumerate(self.datasets):
+            cache_key = ds.get('_cache_key')
+            if cache_key:
+                cache_path = _cache_dir(cache_key)
+                try:
+                    if os.path.exists(cache_path):
+                        shutil.rmtree(cache_path)
+                        cleared_count += 1
+                except Exception as e:
+                    messagebox.showerror("Error", f"Failed to clear cache for video {i+1}: {e}")
+                    return
+        
+        if cleared_count > 0:
+            messagebox.showinfo("Cache Cleared", f"Cleared cache for {cleared_count} video(s). Reload to reprocess.")
+            self._status_msg.set(f"Cleared cache for {cleared_count} video(s)")
+        else:
+            messagebox.showwarning("No Cache", "No cached data found to clear")
+
+    def _open_settings(self):
+        """Open the settings dialog."""
+        SettingsDialog(self, self)
 
     def _toggle_world(self):
         global USE_WORLD_LANDMARKS
