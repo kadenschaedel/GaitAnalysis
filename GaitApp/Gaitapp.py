@@ -409,6 +409,36 @@ SimpleLandmark = namedtuple('SimpleLandmark', ['x', 'y', 'visibility'])
 
 GRAY_BGR = (128, 128, 128)
 
+def _compute_cycle_rmse(y_values, reference_y, max_cycle_length):
+    """compute rmse of a cycle against a reference pattern.
+    
+    y_values: array of joint angle values for this cycle
+    reference_y: resampled reference pattern (normalized to max_cycle_length)
+    max_cycle_length: length to resample both to
+    
+    returns: rmse value
+    """
+    if len(y_values) < 2 or reference_y is None or len(reference_y) == 0:
+        return 0.0
+    
+    try:
+        # resample cycle to match reference length
+        t = np.linspace(0, 1, len(y_values))
+        y_resampled = interp1d(t, y_values)(np.linspace(0, 1, max_cycle_length))
+        
+        # ensure reference has same length
+        if len(reference_y) != max_cycle_length:
+            t_ref = np.linspace(0, 1, len(reference_y))
+            reference_resampled = interp1d(t_ref, reference_y)(np.linspace(0, 1, max_cycle_length))
+        else:
+            reference_resampled = reference_y
+        
+        # compute rmse
+        rmse = float(np.sqrt(np.mean((y_resampled - reference_resampled) ** 2)))
+        return rmse
+    except Exception:
+        return 0.0
+
 # drawing and analysis helpers
 def draw_pose_landmarks_on_frame(frame_bgr, pixel_landmarks, joint_visibility=None, focus_side=None,
                                  skeleton_thickness=None):
@@ -1691,7 +1721,7 @@ class SettingsDialog(tk.Toplevel):
     def __init__(self, parent, dashboard):
         super().__init__(parent)
         self.title("Settings")
-        self.geometry("500x300")
+        self.geometry("550x450")
         self.dashboard = dashboard
         self.configure(bg=BG)
         
@@ -1727,6 +1757,36 @@ class SettingsDialog(tk.Toplevel):
                                    activebackground=BG, activeforeground=TEXT,
                                    command=self._toggle_confidence)
         conf_check.pack(side='right')
+        
+        # Separator
+        sep = tk.Frame(content, bg=BG2, height=1)
+        sep.pack(fill='x', pady=10)
+        
+        # RMSE threshold option
+        rmse_frame = tk.Frame(content, bg=BG)
+        rmse_frame.pack(fill='x', pady=10)
+        
+        rmse_label = tk.Label(rmse_frame, text="RMSE Threshold (°)", 
+                             font=("Helvetica", 10), bg=BG, fg=TEXT)
+        rmse_label.pack(side='left')
+        
+        rmse_info = tk.Label(rmse_frame, text="Lower = stricter filtering", 
+                            font=("Helvetica", 8), bg=BG, fg=SUBTEXT)
+        rmse_info.pack(side='left', padx=(10, 0))
+        
+        self.rmse_var = tk.DoubleVar(value=self.dashboard.rmse_threshold)
+        self.rmse_slider = tk.Scale(
+            rmse_frame,
+            from_=1.0,
+            to=50.0,
+            resolution=0.5,
+            variable=self.rmse_var,
+            orient='horizontal',
+            bg=BG, fg=TEXT, highlightthickness=0,
+            troughcolor=BG3,
+            command=self._on_rmse_change
+        )
+        self.rmse_slider.pack(side='right', fill='x', expand=True, padx=(10, 0))
         
         # Separator
         sep = tk.Frame(content, bg=BG2, height=1)
@@ -1772,6 +1832,15 @@ class SettingsDialog(tk.Toplevel):
         """Toggle confidence scores."""
         self.dashboard.show_confidence = self.conf_var.get()
         self.dashboard.redraw_graph()
+    
+    def _on_rmse_change(self, value):
+        """Update RMSE threshold and redraw."""
+        try:
+            self.dashboard.rmse_threshold = max(1.0, min(50.0, float(value)))
+            _save_ui_settings({'rmse_threshold': self.dashboard.rmse_threshold})
+            self.dashboard.redraw_graph()
+        except Exception:
+            pass
     
     def _open_cache_manager(self):
         """Open the cache manager dialog."""
@@ -2015,6 +2084,8 @@ class GaitAnalysisDashboard(tk.Tk):
         ui_settings = _load_ui_settings()
         self.skeleton_thickness = float(ui_settings.get('skeleton_thickness', DRAW_THICKNESS))
         self.skeleton_thickness = max(0.0, min(float(DRAW_THICKNESS), self.skeleton_thickness))
+        self.rmse_threshold = float(ui_settings.get('rmse_threshold', 15.0))
+        self.rmse_threshold = max(1.0, min(50.0, self.rmse_threshold))
         self.manual_step_mode     = True  # always active
         self.manual_side          = 'right'  # kept for older paths
         self.show_suggestions     = False
@@ -2909,9 +2980,59 @@ class GaitAnalysisDashboard(tk.Tk):
 
                     if not cycles: continue
                     med = np.median(lengths)
-                    ok  = [0.8*med <= l <= 1.2*med for l in lengths]
+                    length_ok  = [0.8*med <= l <= 1.2*med for l in lengths]
+
+                    # always compute mean for rmse checking in overlaid cycles view
+                    if self.resample_cycles:
+                        length_inliers = []
+                        for (x, y), good in zip(cycles, length_ok):
+                            if not good: continue
+                            t = np.linspace(0, 1, len(y))
+                            length_inliers.append(interp1d(t, y)(np.linspace(0, 1, max_cycle_length)))
+                        
+                        # compute mean from length-filtered cycles
+                        if length_inliers:
+                            mean_c = np.nanmean(np.vstack(length_inliers), axis=0)
+                        else:
+                            mean_c = None
+                    else:
+                        mean_c = None
+
+                    # second pass: filter by both length and rmse
+                    ok = []
+                    rmse_ok_list = []
+                    for idx, ((x, y), length_good) in enumerate(zip(cycles, length_ok)):
+                        if not length_good:
+                            ok.append(False)
+                            rmse_ok_list.append(False)
+                            continue
+                        
+                        # check rmse against mean if available
+                        if mean_c is not None and self.resample_cycles:
+                            rmse = _compute_cycle_rmse(y, mean_c, max_cycle_length)
+                            rmse_ok = rmse <= self.rmse_threshold
+                        else:
+                            rmse_ok = True
+                        
+                        rmse_ok_list.append(rmse_ok)
+                        ok.append(rmse_ok)
 
                     if self.show_data:
+                        # plot outlier cycles (length-good but rmse-bad) in gray
+                        for (x, y), length_good, rmse_good in zip(cycles, length_ok, rmse_ok_list):
+                            if not length_good or rmse_good:
+                                # either failed length check or passed rmse - skip for now
+                                continue
+                            # this is a length-good but rmse-bad cycle - plot as outlier
+                            if self.resample_cycles:
+                                t = np.linspace(0, 1, len(y))
+                                y_plot = interp1d(t, y)(np.linspace(0, 1, max_cycle_length))
+                                x_plot = np.arange(max_cycle_length)
+                            else:
+                                x_plot, y_plot = x, y
+                            ax.plot(x_plot, y_plot, color=C_OUTLIER, alpha=0.12, lw=0.6, linestyle=ls)
+                        
+                        # plot good cycles normally
                         for (x, y), good in zip(cycles, ok):
                             if not good: continue
                             if self.resample_cycles:
