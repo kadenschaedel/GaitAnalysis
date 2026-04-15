@@ -410,14 +410,6 @@ SimpleLandmark = namedtuple('SimpleLandmark', ['x', 'y', 'visibility'])
 GRAY_BGR = (128, 128, 128)
 
 def _compute_cycle_rmse(y_values, reference_y, max_cycle_length):
-    """compute rmse of a cycle against a reference pattern.
-    
-    y_values: array of joint angle values for this cycle
-    reference_y: resampled reference pattern (normalized to max_cycle_length)
-    max_cycle_length: length to resample both to
-    
-    returns: rmse value
-    """
     if len(y_values) < 2 or reference_y is None or len(reference_y) == 0:
         return 0.0
     
@@ -1829,12 +1821,10 @@ class SettingsDialog(tk.Toplevel):
                  command=self.destroy).pack(side='right')
     
     def _toggle_confidence(self):
-        """Toggle confidence scores."""
         self.dashboard.show_confidence = self.conf_var.get()
         self.dashboard.redraw_graph()
     
     def _on_rmse_change(self, value):
-        """Update RMSE threshold and redraw."""
         try:
             self.dashboard.rmse_threshold = max(1.0, min(50.0, float(value)))
             _save_ui_settings({'rmse_threshold': self.dashboard.rmse_threshold})
@@ -1843,17 +1833,13 @@ class SettingsDialog(tk.Toplevel):
             pass
     
     def _open_cache_manager(self):
-        """Open the cache manager dialog."""
         CacheManagerDialog(self, _cache_root_dir())
     
     def _open_pdf_export(self):
-        """Open the PDF export dialog."""
         PDFExportDialog(self, self.dashboard)
 
 # PDF export dialog
 class PDFExportDialog(tk.Toplevel):
-    """Dialog to select graphs and outcome measures for PDF export."""
-    
     OUTCOME_MEASURES = {
         'cadence': 'Cadence (% change)',
         'step_var': 'Step Variability (% change)',
@@ -1875,7 +1861,6 @@ class PDFExportDialog(tk.Toplevel):
         self._build_ui()
     
     def _build_ui(self):
-        """Build the export dialog UI."""
         # Title
         title_frame = tk.Frame(self, bg=BG2, height=50)
         title_frame.pack(fill='x', padx=0, pady=0)
@@ -2001,7 +1986,6 @@ class PDFExportDialog(tk.Toplevel):
         return options_frame
     
     def _export_pdf(self):
-        """Export selected graphs and measures to PDF."""
         if not HAS_REPORTLAB:
             messagebox.showerror("Missing Dependency", 
                                "reportlab is required for PDF export.\n\n"
@@ -2872,7 +2856,7 @@ class GaitAnalysisDashboard(tk.Tk):
                         continue
                     values = ad[joint].values.copy().astype(float)
 
-                    if excluded:
+                    if excluded and show_excluded:
                         # draw excluded segments in gray
                         gray_vals = values.copy()
                         gray_vals[~excl_mask] = np.nan
@@ -2881,7 +2865,7 @@ class GaitAnalysisDashboard(tk.Tk):
 
                     # draw the remaining data in the joint color
                     clean_vals = values.copy()
-                    if excluded:
+                    if excluded and show_excluded:
                         clean_vals[excl_mask] = np.nan
                     ax.plot(frames, clean_vals, color=col, lw=1.4,
                             alpha=0.85, linestyle=ls, zorder=3,
@@ -4367,13 +4351,6 @@ class GaitAnalysisDashboard(tk.Tk):
                     print(f"Warning: Could not delete temp file {img_path}: {e}")
     
     def _capture_graph_image(self, graph_type, graph_options=None, limbs=None):
-        """Capture current graph as image with customization options.
-        
-        Args:
-            graph_type: 'continuous' or 'cycles'
-            graph_options: dict with 'show_versions' ('v1'|'v2'|'both') and 'include_excluded' (bool)
-            limbs: dict of joint visibility {'left_hip': bool, 'right_hip': bool, ...}
-        """
         try:
             if graph_options is None:
                 graph_options = {'show_versions': 'both', 'include_excluded': True}
