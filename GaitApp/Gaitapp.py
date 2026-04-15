@@ -13,6 +13,8 @@ import threading
 import time
 import urllib.request
 from collections import OrderedDict, namedtuple
+from datetime import datetime
+from io import BytesIO
 
 # third party imports
 import cv2
@@ -28,6 +30,16 @@ from scipy.interpolate import interp1d
 from scipy.signal import butter, filtfilt, find_peaks
 import tkinter as tk
 from tkinter import filedialog, messagebox
+
+try:
+    from reportlab.lib.pagesizes import letter, A4
+    from reportlab.lib import colors
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import inch
+    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, Image as RLImage, PageBreak
+    HAS_REPORTLAB = True
+except ImportError:
+    HAS_REPORTLAB = False
 
 pyglet.font.add_file(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Coiny-Cyrillic.ttf'))
 
@@ -1732,6 +1744,22 @@ class SettingsDialog(tk.Toplevel):
                  bg=BG3, fg=TEXT, relief='flat', padx=8,
                  command=self._open_cache_manager).pack(side='right')
         
+        # Separator
+        sep2 = tk.Frame(content, bg=BG2, height=1)
+        sep2.pack(fill='x', pady=10)
+        
+        # PDF export option
+        export_frame = tk.Frame(content, bg=BG)
+        export_frame.pack(fill='x', pady=10)
+        
+        export_label = tk.Label(export_frame, text="Export Report", 
+                               font=("Helvetica", 10), bg=BG, fg=TEXT)
+        export_label.pack(side='left')
+        
+        tk.Button(export_frame, text="Print to PDF", font=("Helvetica", 9),
+                 bg='#27ae60', fg=TEXT, relief='flat', padx=8,
+                 command=self._open_pdf_export).pack(side='right')
+        
         # Bottom buttons
         btn_frame = tk.Frame(self, bg=BG)
         btn_frame.pack(fill='x', padx=20, pady=15)
@@ -1748,6 +1776,207 @@ class SettingsDialog(tk.Toplevel):
     def _open_cache_manager(self):
         """Open the cache manager dialog."""
         CacheManagerDialog(self, _cache_root_dir())
+    
+    def _open_pdf_export(self):
+        """Open the PDF export dialog."""
+        PDFExportDialog(self, self.dashboard)
+
+# PDF export dialog
+class PDFExportDialog(tk.Toplevel):
+    """Dialog to select graphs and outcome measures for PDF export."""
+    
+    OUTCOME_MEASURES = {
+        'cadence': 'Cadence (% change)',
+        'step_var': 'Step Variability (% change)',
+        'knee_mean': 'Knee Angle Mean (% change)',
+        'knee_peak': 'Knee Angle Peak (% change)',
+        'hip_mean': 'Hip Angle Mean (% change)',
+        'hip_peak': 'Hip Angle Peak (% change)',
+        'knee_sym': 'Knee Symmetry (% change)',
+        'hip_sym': 'Hip Symmetry (% change)',
+    }
+    
+    def __init__(self, parent, dashboard):
+        super().__init__(parent)
+        self.title("Export to PDF")
+        self.geometry("550x900")
+        self.dashboard = dashboard
+        self.configure(bg=BG)
+        
+        self._build_ui()
+    
+    def _build_ui(self):
+        """Build the export dialog UI."""
+        # Title
+        title_frame = tk.Frame(self, bg=BG2, height=50)
+        title_frame.pack(fill='x', padx=0, pady=0)
+        tk.Label(title_frame, text="Export Gait Analysis Report",
+                font=("Helvetica", 12, "bold"), bg=BG2, fg=TEXT).pack(side='left', padx=10, pady=8)
+        
+        # Content frame with scrollbar
+        canvas_frame = tk.Frame(self, bg=BG)
+        canvas_frame.pack(fill='both', expand=True, padx=10, pady=10)
+        
+        canvas = tk.Canvas(canvas_frame, bg=BG, highlightthickness=0)
+        scrollbar = tk.Scrollbar(canvas_frame, orient='vertical', command=canvas.yview)
+        scrollable = tk.Frame(canvas, bg=BG)
+        scrollable.bind('<Configure>', lambda e: canvas.configure(scrollregion=canvas.bbox('all')))
+        canvas.create_window((0, 0), window=scrollable, anchor='nw')
+        canvas.configure(yscrollcommand=scrollbar.set)
+        
+        canvas.pack(side='left', fill='both', expand=True)
+        scrollbar.pack(side='right', fill='y')
+        
+        # Graphs section
+        graphs_frame = tk.LabelFrame(scrollable, text="Select Graphs & Options", bg=BG, fg=TEXT,
+                                    font=("Helvetica", 10, "bold"))
+        graphs_frame.pack(fill='x', pady=(10, 5))
+        
+        self.graph_vars = {}
+        self.graph_vars['continuous'] = tk.BooleanVar(value=True)
+        self.graph_vars['cycles'] = tk.BooleanVar(value=True)
+        self.graph_options = {}
+        
+        # Continuous graph options
+        continuous_check = tk.Checkbutton(graphs_frame, text="Continuous View (Raw angle data)",
+                      variable=self.graph_vars['continuous'], bg=BG, fg=TEXT,
+                      activebackground=BG, activeforeground=TEXT)
+        continuous_check.pack(anchor='w', padx=10, pady=4)
+        
+        self.graph_options['continuous'] = self._create_graph_options_frame(graphs_frame, 'continuous')
+        
+        # Cycles graph options
+        cycles_check = tk.Checkbutton(graphs_frame, text="Overlaid Cycles (Normalized gait cycles)",
+                      variable=self.graph_vars['cycles'], bg=BG, fg=TEXT,
+                      activebackground=BG, activeforeground=TEXT)
+        cycles_check.pack(anchor='w', padx=10, pady=4)
+        
+        self.graph_options['cycles'] = self._create_graph_options_frame(graphs_frame, 'cycles')
+        
+        # Limbs section
+        limbs_frame = tk.LabelFrame(scrollable, text="Select Limbs", bg=BG, fg=TEXT,
+                                   font=("Helvetica", 10, "bold"))
+        limbs_frame.pack(fill='x', pady=5)
+        
+        self.limb_vars = {}
+        limbs = [
+            ('left_hip', 'Left Hip'),
+            ('left_knee', 'Left Knee'),
+            ('left_ankle', 'Left Ankle'),
+            ('right_hip', 'Right Hip'),
+            ('right_knee', 'Right Knee'),
+            ('right_ankle', 'Right Ankle'),
+        ]
+        
+        for key, label in limbs:
+            self.limb_vars[key] = tk.BooleanVar(value=True)
+            tk.Checkbutton(limbs_frame, text=label,
+                          variable=self.limb_vars[key], bg=BG, fg=TEXT,
+                          activebackground=BG, activeforeground=TEXT).pack(anchor='w', padx=10, pady=2)
+        
+        # Outcome measures section
+        measures_frame = tk.LabelFrame(scrollable, text="Outcome Measures", bg=BG, fg=TEXT,
+                                      font=("Helvetica", 10, "bold"))
+        measures_frame.pack(fill='x', pady=5)
+        
+        self.measure_vars = {}
+        for key, label in self.OUTCOME_MEASURES.items():
+            self.measure_vars[key] = tk.BooleanVar(value=True)
+            tk.Checkbutton(measures_frame, text=label,
+                          variable=self.measure_vars[key], bg=BG, fg=TEXT,
+                          activebackground=BG, activeforeground=TEXT).pack(anchor='w', padx=10, pady=2)
+        
+        # Info text
+        info_frame = tk.Frame(scrollable, bg=BG)
+        info_frame.pack(fill='x', pady=10)
+        
+        tk.Label(info_frame, text="Note: PDF will be generated for currently loaded video pair.",
+                font=("Helvetica", 9), bg=BG, fg=SUBTEXT, wraplength=400, justify='left').pack(anchor='w', padx=10)
+        
+        # Bottom buttons
+        btn_frame = tk.Frame(self, bg=BG)
+        btn_frame.pack(fill='x', padx=10, pady=15)
+        
+        tk.Button(btn_frame, text="Print to PDF", font=("Helvetica", 11),
+                 bg='#27ae60', fg=TEXT, relief='flat', padx=15, pady=8,
+                 command=self._export_pdf).pack(side='right', padx=4)
+        
+        tk.Button(btn_frame, text="Cancel", font=("Helvetica", 10),
+                 bg=BG3, fg=TEXT, relief='flat', padx=12, pady=6,
+                 command=self.destroy).pack(side='right', padx=4)
+    
+    def _create_graph_options_frame(self, parent, graph_type):
+        """Create graph options frame for V1/V2/Both and excluded areas toggle."""
+        options_frame = tk.Frame(parent, bg=BG)
+        options_frame.pack(fill='x', padx=30, pady=2)
+        
+        # Version selection
+        version_var = tk.StringVar(value='both')
+        self.graph_options[f'{graph_type}_version'] = version_var
+        
+        tk.Label(options_frame, text="Show:", bg=BG, fg=TEXT, font=("Helvetica", 9)).pack(side='left', padx=(0, 5))
+        tk.Radiobutton(options_frame, text="V1", variable=version_var, value='v1',
+                      bg=BG, fg=TEXT, activebackground=BG, activeforeground=TEXT).pack(side='left', padx=3)
+        tk.Radiobutton(options_frame, text="V2", variable=version_var, value='v2',
+                      bg=BG, fg=TEXT, activebackground=BG, activeforeground=TEXT).pack(side='left', padx=3)
+        tk.Radiobutton(options_frame, text="Both", variable=version_var, value='both',
+                      bg=BG, fg=TEXT, activebackground=BG, activeforeground=TEXT).pack(side='left', padx=3)
+        
+        # Excluded areas toggle
+        excluded_var = tk.BooleanVar(value=True)
+        self.graph_options[f'{graph_type}_excluded'] = excluded_var
+        tk.Checkbutton(options_frame, text="Show excluded areas", variable=excluded_var,
+                      bg=BG, fg=TEXT, activebackground=BG, activeforeground=TEXT,
+                      font=("Helvetica", 9)).pack(side='left', padx=10)
+        
+        return options_frame
+    
+    def _export_pdf(self):
+        """Export selected graphs and measures to PDF."""
+        if not HAS_REPORTLAB:
+            messagebox.showerror("Missing Dependency", 
+                               "reportlab is required for PDF export.\n\n"
+                               "Install with: pip install reportlab")
+            return
+        
+        if len(self.dashboard.datasets) < 2:
+            messagebox.showwarning("Not Enough Videos", 
+                                 "Comparison reports require 2 videos.")
+            return
+        
+        # Get file path
+        file_path = filedialog.asksaveasfilename(
+            defaultextension=".pdf",
+            filetypes=[("PDF Files", "*.pdf"), ("All Files", "*.*")],
+            initialfile=f"gait_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+        )
+        
+        if not file_path:
+            return
+        
+        try:
+            # Build graphs dict with full options
+            graphs = {}
+            for graph_type in ['continuous', 'cycles']:
+                if self.graph_vars[graph_type].get():
+                    graphs[graph_type] = {
+                        'show_versions': self.graph_options[f'{graph_type}_version'].get(),
+                        'include_excluded': self.graph_options[f'{graph_type}_excluded'].get(),
+                    }
+            
+            # Build limbs dict
+            limbs = {k: v.get() for k, v in self.limb_vars.items()}
+            
+            self.dashboard._generate_pdf(
+                file_path,
+                graphs=graphs,
+                limbs=limbs,
+                measures={k: v.get() for k, v in self.measure_vars.items()}
+            )
+            messagebox.showinfo("Success", f"PDF exported to:\n{file_path}")
+            self.destroy()
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to generate PDF:\n{str(e)}")
 
 # dashboard
 class GaitAnalysisDashboard(tk.Tk):
@@ -2552,8 +2781,11 @@ class GaitAnalysisDashboard(tk.Tk):
                 si  = _src_idx(ds)
                 ls  = linestyles[si % 2]
 
-                for start_frame, end_frame in excluded:
-                    ax.axvspan(start_frame, end_frame, alpha=0.10, color='darkgray', zorder=1)
+                # Show excluded regions unless explicitly hidden (for PDF export)
+                show_excluded = getattr(self, '_show_excluded_in_pdf', True)
+                if show_excluded:
+                    for start_frame, end_frame in excluded:
+                        ax.axvspan(start_frame, end_frame, alpha=0.10, color='darkgray', zorder=1)
 
                 # build an exclusion mask for this dataset
                 frames = ad['frame_num'].values
@@ -3893,6 +4125,195 @@ class GaitAnalysisDashboard(tk.Tk):
         self._markup_count_lbl.config(
             text=f"{total} {noun} step{'s' if total != 1 else ''} marked",
             fg=marker_col)
+
+    # PDF export
+    def _generate_pdf(self, output_path, graphs, limbs, measures):
+        """Generate a PDF report with selected graphs and outcome measures."""
+        from reportlab.lib.pagesizes import letter
+        from reportlab.lib import colors
+        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+        from reportlab.lib.units import inch
+        from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, Image as RLImage, PageBreak
+        
+        temp_images = []
+        
+        try:
+            # Create PDF
+            doc = SimpleDocTemplate(output_path, pagesize=letter, topMargin=0.5*inch, bottomMargin=0.5*inch)
+            story = []
+            styles = getSampleStyleSheet()
+            
+            # Title
+            title_style = ParagraphStyle(
+                'CustomTitle',
+                parent=styles['Heading1'],
+                fontSize=24,
+                textColor=colors.HexColor('#2c3e50'),
+                spaceAfter=6,
+                alignment=1  # center
+            )
+            story.append(Paragraph("Gait Analysis Report", title_style))
+            story.append(Spacer(1, 0.1*inch))
+            
+            # Subtitle with date
+            subtitle_style = ParagraphStyle(
+                'Subtitle',
+                parent=styles['Normal'],
+                fontSize=11,
+                textColor=colors.HexColor('#7f8c8d'),
+                alignment=1
+            )
+            story.append(Paragraph(f"Generated: {datetime.now().strftime('%B %d, %Y at %H:%M')}", subtitle_style))
+            story.append(Spacer(1, 0.3*inch))
+            
+            # Save graphs as images and add to PDF
+            graph_height = 3.5*inch
+            graph_width = 6.5*inch
+            
+            if 'continuous' in graphs:
+                story.append(Paragraph("Continuous View (Raw Angle Data)", styles['Heading2']))
+                img_path = self._capture_graph_image('continuous', graphs['continuous'], limbs)
+                if img_path:
+                    try:
+                        story.append(RLImage(img_path, width=graph_width, height=graph_height))
+                        story.append(Spacer(1, 0.2*inch))
+                        temp_images.append(img_path)
+                    except Exception as e:
+                        print(f"Error adding continuous graph image: {e}")
+            
+            if 'cycles' in graphs:
+                story.append(Paragraph("Overlaid Cycles (Normalized Gait Cycles)", styles['Heading2']))
+                img_path = self._capture_graph_image('cycles', graphs['cycles'], limbs)
+                if img_path:
+                    try:
+                        story.append(RLImage(img_path, width=graph_width, height=graph_height))
+                        story.append(Spacer(1, 0.2*inch))
+                        temp_images.append(img_path)
+                    except Exception as e:
+                        print(f"Error adding cycles graph image: {e}")
+            
+            # Outcome measures table
+            if any(measures.values()) and len(self.datasets) >= 2:
+                story.append(PageBreak())
+                story.append(Paragraph("Outcome Measures", styles['Heading2']))
+                story.append(Spacer(1, 0.15*inch))
+                
+                # Compute metrics
+                metrics = compute_metrics(self.datasets[0], self.datasets[1])
+                
+                # Build table data
+                table_data = [['Measure', 'Change (%)']  ]
+                
+                measure_labels = PDFExportDialog.OUTCOME_MEASURES
+                for key, label in measure_labels.items():
+                    if measures.get(key):
+                        value = metrics.get(key, 0)
+                        value_str = f"{value:+.1f}%" if isinstance(value, (int, float)) else "N/A"
+                        table_data.append([label, value_str])
+                
+                # Create table
+                if len(table_data) > 1:
+                    table = Table(table_data, colWidths=[4.5*inch, 1.5*inch])
+                    table.setStyle(TableStyle([
+                        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#34495e')),
+                        ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+                        ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+                        ('ALIGN', (1, 0), (1, -1), 'RIGHT'),
+                        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                        ('FONTSIZE', (0, 0), (-1, 0), 11),
+                        ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+                        ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
+                        ('GRID', (0, 0), (-1, -1), 1, colors.black),
+                        ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#f5f5f5')]),
+                        ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
+                        ('FONTSIZE', (0, 1), (-1, -1), 10),
+                        ('TOPPADDING', (0, 1), (-1, -1), 8),
+                        ('BOTTOMPADDING', (0, 1), (-1, -1), 8),
+                    ]))
+                    story.append(table)
+            
+            # Build PDF
+            doc.build(story)
+            
+        finally:
+            # Clean up temporary image files
+            for img_path in temp_images:
+                try:
+                    if os.path.exists(img_path):
+                        time.sleep(0.05)  # Small delay to ensure file is released
+                        os.unlink(img_path)
+                except Exception as e:
+                    print(f"Warning: Could not delete temp file {img_path}: {e}")
+    
+    def _capture_graph_image(self, graph_type, graph_options=None, limbs=None):
+        """Capture current graph as image with customization options.
+        
+        Args:
+            graph_type: 'continuous' or 'cycles'
+            graph_options: dict with 'show_versions' ('v1'|'v2'|'both') and 'include_excluded' (bool)
+            limbs: dict of joint visibility {'left_hip': bool, 'right_hip': bool, ...}
+        """
+        try:
+            if graph_options is None:
+                graph_options = {'show_versions': 'both', 'include_excluded': True}
+            if limbs is None:
+                limbs = {k: True for k in ('left_hip','right_hip','left_knee','right_knee','left_ankle','right_ankle')}
+            
+            # Create temp file with a proper path
+            import tempfile as tf
+            temp_dir = tf.gettempdir()
+            temp_path = os.path.join(temp_dir, f'gait_graph_{int(time.time()*1000)}_{graph_type}.png')
+            
+            # Save current graph state
+            orig_mode = self.show_overlaid_cycles
+            orig_graph_mode = self.graph_show_mode
+            orig_joint_visibility = self.joint_visibility.copy()
+            orig_show_excluded = getattr(self, '_show_excluded_in_pdf', True)
+            
+            try:
+                # Set view mode
+                if graph_type == 'continuous':
+                    self.show_overlaid_cycles = False
+                elif graph_type == 'cycles':
+                    self.show_overlaid_cycles = True
+                else:
+                    return None
+                
+                # Set version display mode
+                self.graph_show_mode = graph_options.get('show_versions', 'both')
+                
+                # Set joint visibility
+                self.joint_visibility = limbs.copy()
+                
+                # Set excluded areas visibility
+                self._show_excluded_in_pdf = graph_options.get('include_excluded', True)
+                
+                self.redraw_graph()
+                self.update()
+                
+                # Capture the matplotlib figure - save with high DPI
+                self._fig.savefig(temp_path, dpi=150, bbox_inches='tight', format='png')
+                
+                # Ensure file is written to disk
+                import gc
+                gc.collect()
+                time.sleep(0.1)
+                
+                # Verify file exists before returning
+                if not os.path.exists(temp_path) or os.path.getsize(temp_path) == 0:
+                    raise Exception(f"Image file not created or empty: {temp_path}")
+                
+                return temp_path
+            finally:
+                # Restore original state
+                self.show_overlaid_cycles = orig_mode
+                self.graph_show_mode = orig_graph_mode
+                self.joint_visibility = orig_joint_visibility
+                self._show_excluded_in_pdf = orig_show_excluded
+                self.redraw_graph()
+        except Exception as e:
+            print(f"Error capturing graph: {e}")
+            return None
 
     # close
     def _on_close(self):
