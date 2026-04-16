@@ -116,7 +116,6 @@ def _butterworth_lowpass_filter(data, cutoff=6, fs=240, order=4):
 
 
 def _fix_jitter_outliers(df, max_frame_displacement=0.15, columns=None):
-    """detect frames with abnormal displacement and interpolate from neighbors."""
     if columns is None:
         # auto-detect coordinate columns (landmark_i_x, landmark_i_y, landmark_i_z)
         columns = [c for c in df.columns if 'landmark_' in c and c.endswith(('_x', '_y', '_z'))]
@@ -1157,7 +1156,6 @@ def _detect_subject_orientation(video_path):
 
 
 def _save_jitter_log(world_landmarks_list, video_path):
-    """save leg landmark positions and frame-to-frame displacement to a CSV file for jitter analysis."""
     import csv
     from datetime import datetime
     
