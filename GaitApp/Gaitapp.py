@@ -58,6 +58,7 @@ SAVE_HEIGHT  = 540
 JPEG_QUALITY = 65
 CACHE_FRAMES = 96
 DEBUG_DIRECTION_DIAGNOSTICS = False
+DEBUG_LOG_JITTER = True 
 CACHE_SCHEMA_VERSION = 1
 
 # pose model path
@@ -332,7 +333,7 @@ BG      = "#f0f0f0"   # window background
 BG2     = "#d6d6d6"   # header and panels
 BG3     = "#c8c8c8"   # cards and toolbar
 BG_VID  = "#d8d8d8"   # video canvas
-BG_PLOT = "#b8b8b8"   # graph axes
+BG_PLOT = "#dbdbdb"   # graph axes
 BG_INIT = "#c0c0c0"   # graph before data
 
 # text colors
@@ -1058,6 +1059,85 @@ def _detect_subject_orientation(video_path):
     return vertical_votes > detections / 2
 
 
+def _save_jitter_log(world_landmarks_list, video_path):
+    """save leg landmark positions and frame-to-frame displacement to a CSV file for jitter analysis."""
+    import csv
+    from datetime import datetime
+    
+    output_dir = os.path.expanduser('~/Desktop/Gait_Analysis')
+    os.makedirs(output_dir, exist_ok=True)
+    vid_name = os.path.splitext(os.path.basename(video_path))[0]
+    timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+    output_path = os.path.join(output_dir, f'jitter_log_{vid_name}_{timestamp}.csv')
+    
+    # leg joint indices in mediapipe
+    left_hip_idx, right_hip_idx = 23, 24
+    left_knee_idx, right_knee_idx = 25, 26
+    left_ankle_idx, right_ankle_idx = 27, 28
+    
+    joint_indices = {
+        'left_hip': left_hip_idx,
+        'right_hip': right_hip_idx,
+        'left_knee': left_knee_idx,
+        'right_knee': right_knee_idx,
+        'left_ankle': left_ankle_idx,
+        'right_ankle': right_ankle_idx,
+    }
+    
+    rows = []
+    prev_positions = {}  # track previous frame positions for displacement calculation
+    
+    for frame_num, world_lm in enumerate(world_landmarks_list, start=1):
+        if world_lm is None or len(world_lm) == 0:
+            continue
+        
+        row = {'frame_num': frame_num}
+        
+        # extract and log each leg joint position
+        for joint_name, idx in joint_indices.items():
+            if idx < len(world_lm):
+                lm = world_lm[idx]
+                row[f'{joint_name}_x'] = float(lm.x)
+                row[f'{joint_name}_y'] = float(lm.y)
+                row[f'{joint_name}_z'] = float(lm.z)
+                row[f'{joint_name}_visibility'] = float(lm.visibility)
+                
+                # calculate frame-to-frame displacement
+                if joint_name in prev_positions:
+                    prev_x, prev_y, prev_z = prev_positions[joint_name]
+                    displacement = np.sqrt(
+                        (lm.x - prev_x)**2 + 
+                        (lm.y - prev_y)**2 + 
+                        (lm.z - prev_z)**2
+                    )
+                    row[f'{joint_name}_displacement'] = float(displacement)
+                else:
+                    row[f'{joint_name}_displacement'] = 0.0
+                
+                prev_positions[joint_name] = (lm.x, lm.y, lm.z)
+        
+        rows.append(row)
+    
+    # write to CSV
+    if rows:
+        fieldnames = ['frame_num']
+        for joint_name in joint_indices.keys():
+            fieldnames.extend([
+                f'{joint_name}_x', f'{joint_name}_y', f'{joint_name}_z',
+                f'{joint_name}_visibility', f'{joint_name}_displacement'
+            ])
+        
+        with open(output_path, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+        
+        print(f"jitter log saved: {output_path}")
+        return output_path
+    
+    return None
+
+
 def process_video(video_path, ann_dir, progress_cb, status_cb,
                   target_output_size=None, needs_rotation=None,
                   crop_rect=None, cache_key=None, cache_meta=None):
@@ -1120,6 +1200,7 @@ def process_video(video_path, ann_dir, progress_cb, status_cb,
     landmarker = PoseLandmarker.create_from_options(opts)
 
     world_rows, pixel_rows, landmarks, landmark_depths, confidence_rows = [], [], [], [], []
+    world_landmarks_list = []  # for jitter debugging
     frame_count = 0
 
     frame_output_dir = ann_dir
@@ -1168,6 +1249,9 @@ def process_video(video_path, ann_dir, progress_cb, status_cb,
             pixel_lm = result.pose_landmarks[0]
             world_lm = (result.pose_world_landmarks[0]
                         if result.pose_world_landmarks else pixel_lm)
+            
+            # collect world landmarks for jitter debugging
+            world_landmarks_list.append(world_lm)
 
             # save the clean frame so the viewer has no black bars
             raw = view_frame.copy()
@@ -1251,6 +1335,7 @@ def process_video(video_path, ann_dir, progress_cb, status_cb,
             pixel_rows.append(p_row)
         else:
             landmarks.append(None)
+            world_landmarks_list.append(None)
             landmark_depths.append(None)
             confidence_rows.append({'frame_num': frame_count, 'avg_confidence': 0.0})
 
@@ -1269,6 +1354,15 @@ def process_video(video_path, ann_dir, progress_cb, status_cb,
             status_cb(f"Diagnostics saved: {os.path.basename(diag_path)}")
         except Exception as e:
             status_cb(f"Diagnostic logging failed: {e}")
+    
+    # log landmark positions for jitter analysis
+    if DEBUG_LOG_JITTER:
+        try:
+            jitter_log_path = _save_jitter_log(world_landmarks_list, video_path)
+            if jitter_log_path:
+                status_cb(f"Jitter log saved: {os.path.basename(jitter_log_path)}")
+        except Exception as e:
+            status_cb(f"Jitter logging failed: {e}")
 
     for df in (df_w, df_p):
         for col in df.columns:
@@ -3002,28 +3096,40 @@ class GaitAnalysisDashboard(tk.Tk):
                         ok.append(rmse_ok)
 
                     if self.show_data:
-                        # plot outlier cycles (length-good but rmse-bad) in gray
-                        for (x, y), length_good, rmse_good in zip(cycles, length_ok, rmse_ok_list):
-                            if not length_good or rmse_good:
-                                # either failed length check or passed rmse - skip for now
-                                continue
-                            # this is a length-good but rmse-bad cycle - plot as outlier
-                            if self.resample_cycles:
+                        if self.resample_cycles:
+                            # Resample mode: show length-good cycles (gray if rmse-bad), HIDE length-bad
+                            for (x, y), length_good, rmse_good in zip(cycles, length_ok, rmse_ok_list):
+                                if not length_good:
+                                    # Hide cycles that fail length check
+                                    continue
+                                # This cycle passed length check - show in color or gray based on RMSE
+                                is_rmse_bad = not rmse_good
+                                plot_col = C_OUTLIER if is_rmse_bad else col
+                                plot_alpha = 0.12 if is_rmse_bad else 0.25
+                                
                                 t = np.linspace(0, 1, len(y))
                                 y_plot = interp1d(t, y)(np.linspace(0, 1, max_cycle_length))
                                 x_plot = np.arange(max_cycle_length)
-                            else:
-                                x_plot, y_plot = x, y
-                            ax.plot(x_plot, y_plot, color=C_OUTLIER, alpha=0.12, lw=0.6, linestyle=ls)
-                        
-                        # plot good cycles normally
-                        for (x, y), good in zip(cycles, ok):
-                            if not good: continue
-                            if self.resample_cycles:
-                                t = np.linspace(0, 1, len(y))
-                                y = interp1d(t, y)(np.linspace(0, 1, max_cycle_length))
-                                x = np.arange(max_cycle_length)
-                            ax.plot(x, y, color=col, alpha=0.25, lw=0.8, linestyle=ls)
+                                ax.plot(x_plot, y_plot, color=plot_col, alpha=plot_alpha, lw=0.6, linestyle=ls)
+                        else:
+                            # Non-resample mode: show ALL cycles, grayed out if they're length-bad
+                            # First collect y-values from good cycles to set axis range
+                            good_y_vals = []
+                            for (x, y), good in zip(cycles, length_ok):
+                                if good:
+                                    good_y_vals.extend(y)
+                            
+                            for (x, y), length_good in zip(cycles, length_ok):
+                                is_length_bad = not length_good
+                                plot_col = C_OUTLIER if is_length_bad else col
+                                plot_alpha = 0.12 if is_length_bad else 0.25
+                                ax.plot(x, y, color=plot_col, alpha=plot_alpha, lw=0.8, linestyle=ls)
+                            
+                            # Set y-limits based on good cycles only
+                            if good_y_vals:
+                                y_min, y_max = np.nanmin(good_y_vals), np.nanmax(good_y_vals)
+                                y_margin = (y_max - y_min) * 0.1  # 10% margin
+                                ax.set_ylim(y_min - y_margin, y_max + y_margin)
 
                     if self.resample_cycles and self.show_mean:
                         inliers = []
@@ -3854,9 +3960,9 @@ class GaitAnalysisDashboard(tk.Tk):
                                    parent=self)
             return
 
+        # Keep existing steps and persist them
         for ds in self.datasets:
             if ds:
-                ds['step_frames'] = []
                 self._persist_dataset_markup(ds)
 
         self._markup_required_videos = [True] * len(self.datasets)
