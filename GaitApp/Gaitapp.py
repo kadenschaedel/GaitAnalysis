@@ -50,8 +50,8 @@ def resource_path(filename):
 
 # analysis settings
 SLOWMO_FPS    = 240
-FILTER_CUTOFF = 4   # increased cutoff to reduce drag while maintaining smoothing
-FILTER_ORDER  = 5      # keep at 5
+FILTER_CUTOFF = 6   # increased cutoff to reduce drag while maintaining smoothing
+FILTER_ORDER  = 3      # reduced order for weaker filter
 
 # frame storage settings
 SAVE_HEIGHT  = 540
