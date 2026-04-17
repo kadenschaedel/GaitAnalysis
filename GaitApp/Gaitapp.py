@@ -1933,7 +1933,7 @@ class SettingsDialog(tk.Toplevel):
         self.rmse_var = tk.DoubleVar(value=self.dashboard.rmse_threshold)
         self.rmse_slider = tk.Scale(
             rmse_frame,
-            from_=1.0,
+            from_=0.0,
             to=100.0,
             resolution=0.5,
             variable=self.rmse_var,
@@ -2254,8 +2254,8 @@ class GaitAnalysisDashboard(tk.Tk):
         ui_settings = _load_ui_settings()
         self.skeleton_thickness = float(ui_settings.get('skeleton_thickness', DRAW_THICKNESS))
         self.skeleton_thickness = max(0.0, min(float(DRAW_THICKNESS), self.skeleton_thickness))
-        self.rmse_threshold = float(ui_settings.get('rmse_threshold', 15.0))
-        self.rmse_threshold = max(1.0, min(50.0, self.rmse_threshold))
+        self.rmse_threshold = float(ui_settings.get('rmse_threshold', 25.0))
+        self.rmse_threshold = max(0.0, min(100.0, self.rmse_threshold))
         self.manual_step_mode     = True  # always active
         self.manual_side          = 'right'  # kept for older paths
         self.show_suggestions     = False
