@@ -1997,7 +1997,6 @@ class SettingsDialog(tk.Toplevel):
             pass
     
     def _open_cache_manager(self):
-        """Open the cache manager dialog (singleton pattern)."""
         if self.dashboard._cache_manager_dialog is not None and self.dashboard._cache_manager_dialog.winfo_exists():
             self.dashboard._cache_manager_dialog.lift()
             self.dashboard._cache_manager_dialog.focus()
@@ -2250,6 +2249,7 @@ class GaitAnalysisDashboard(tk.Tk):
         self.show_normative       = True
         self.show_data            = True
         self.show_confidence      = False  # confidence scores hidden by default
+        self.show_outliers_only   = False  # toggle to show only outlier cycles
         self.active_dataset_idx   = 0
         ui_settings = _load_ui_settings()
         self.skeleton_thickness = float(ui_settings.get('skeleton_thickness', DRAW_THICKNESS))
@@ -2443,7 +2443,7 @@ class GaitAnalysisDashboard(tk.Tk):
 
         # display toggles for cycle view
         self._display_btns = {}
-        for label, key in [("Mean", "mean"), ("Data", "data"), ("Normal", "normal")]:
+        for label, key in [("Mean", "mean"), ("Data", "data"), ("Normal", "normal"), ("Outliers", "outliers")]:
             btn = tk.Button(self._legend_frame, text=label,
                         font=("Helvetica", 7, "bold"), bg=BG3, fg=TEXT,
                         relief='flat', cursor='hand2',
@@ -3193,42 +3193,62 @@ class GaitAnalysisDashboard(tk.Tk):
                         ok.append(rmse_ok)
 
                     if self.show_data:
-                        if self.resample_cycles:
-                            # Resample mode: show length-good cycles (gray if rmse-bad), HIDE length-bad
-                            for (x, y), length_good, rmse_good in zip(cycles, length_ok, rmse_ok_list):
-                                if not length_good:
-                                    # Hide cycles that fail length check
-                                    continue
-                                # This cycle passed length check - show in color or gray based on RMSE
-                                is_rmse_bad = not rmse_good
-                                plot_col = C_OUTLIER if is_rmse_bad else col
-                                plot_alpha = 0.12 if is_rmse_bad else 0.25
-                                
-                                t = np.linspace(0, 1, len(y))
-                                y_plot = interp1d(t, y)(np.linspace(0, 1, max_cycle_length))
-                                x_plot = np.arange(max_cycle_length)
-                                ax.plot(x_plot, y_plot, color=plot_col, alpha=plot_alpha, lw=0.6, linestyle=ls)
+                        if self.show_outliers_only:
+                            # show ONLY outlier cycles in bright color
+                            if self.resample_cycles:
+                                for (x, y), length_good, rmse_good in zip(cycles, length_ok, rmse_ok_list):
+                                    is_outlier = (not length_good) or (not rmse_good)
+                                    if not is_outlier:
+                                        continue
+                                    # show outlier in bright color, high alpha
+                                    t = np.linspace(0, 1, len(y))
+                                    y_plot = interp1d(t, y)(np.linspace(0, 1, max_cycle_length))
+                                    x_plot = np.arange(max_cycle_length)
+                                    ax.plot(x_plot, y_plot, color=col, alpha=0.7, lw=1.2, linestyle=ls)
+                            else:
+                                for (x, y), length_good in zip(cycles, length_ok):
+                                    if length_good:
+                                        continue
+                                    # show length-bad cycle in bright color
+                                    ax.plot(x, y, color=col, alpha=0.7, lw=1.2, linestyle=ls)
                         else:
-                            # Non-resample mode: show ALL cycles, grayed out if they're length-bad
-                            # First collect y-values from good cycles to set axis range
-                            good_y_vals = []
-                            for (x, y), good in zip(cycles, length_ok):
-                                if good:
-                                    good_y_vals.extend(y)
-                            
-                            for (x, y), length_good in zip(cycles, length_ok):
-                                is_length_bad = not length_good
-                                plot_col = C_OUTLIER if is_length_bad else col
-                                plot_alpha = 0.12 if is_length_bad else 0.25
-                                ax.plot(x, y, color=plot_col, alpha=plot_alpha, lw=0.8, linestyle=ls)
-                            
-                            # Set y-limits based on good cycles only
-                            if good_y_vals:
-                                y_min, y_max = np.nanmin(good_y_vals), np.nanmax(good_y_vals)
-                                y_margin = (y_max - y_min) * 0.1  # 10% margin
-                                ax.set_ylim(y_min - y_margin, y_max + y_margin)
+                            # normal mode: show all with filtering
+                            if self.resample_cycles:
+                                # Resample mode: show length-good cycles (gray if rmse-bad), HIDE length-bad
+                                for (x, y), length_good, rmse_good in zip(cycles, length_ok, rmse_ok_list):
+                                    if not length_good:
+                                        # Hide cycles that fail length check
+                                        continue
+                                    # This cycle passed length check - show in color or gray based on RMSE
+                                    is_rmse_bad = not rmse_good
+                                    plot_col = C_OUTLIER if is_rmse_bad else col
+                                    plot_alpha = 0.12 if is_rmse_bad else 0.25
+                                    
+                                    t = np.linspace(0, 1, len(y))
+                                    y_plot = interp1d(t, y)(np.linspace(0, 1, max_cycle_length))
+                                    x_plot = np.arange(max_cycle_length)
+                                    ax.plot(x_plot, y_plot, color=plot_col, alpha=plot_alpha, lw=0.6, linestyle=ls)
+                            else:
+                                # Non-resample mode: show ALL cycles, grayed out if they're length-bad
+                                # First collect y-values from good cycles to set axis range
+                                good_y_vals = []
+                                for (x, y), good in zip(cycles, length_ok):
+                                    if good:
+                                        good_y_vals.extend(y)
+                                
+                                for (x, y), length_good in zip(cycles, length_ok):
+                                    is_length_bad = not length_good
+                                    plot_col = C_OUTLIER if is_length_bad else col
+                                    plot_alpha = 0.12 if is_length_bad else 0.25
+                                    ax.plot(x, y, color=plot_col, alpha=plot_alpha, lw=0.8, linestyle=ls)
+                                
+                                # Set y-limits based on good cycles only
+                                if good_y_vals:
+                                    y_min, y_max = np.nanmin(good_y_vals), np.nanmax(good_y_vals)
+                                    y_margin = (y_max - y_min) * 0.1  # 10% margin
+                                    ax.set_ylim(y_min - y_margin, y_max + y_margin)
 
-                    if self.resample_cycles and self.show_mean:
+                    if self.resample_cycles and self.show_mean and not self.show_outliers_only:
                         inliers = []
                         for (x, y), good in zip(cycles, ok):
                             if not good: continue
@@ -3240,7 +3260,7 @@ class GaitAnalysisDashboard(tk.Tk):
                                     color=col, lw=2.2, linestyle=ls,
                                     label=f"{joint.replace('_',' ').title()} V{si+1} mean")
 
-            if self.resample_cycles and self.show_normative:
+            if self.resample_cycles and self.show_normative and not self.show_outliers_only:
                 # scale normative data to the current x range
                 norm_x_resampled = np.linspace(0, max_cycle_length, 100)
                 
@@ -3911,6 +3931,10 @@ class GaitAnalysisDashboard(tk.Tk):
             if not self.show_overlaid_cycles:
                 return
             self.show_normative = not self.show_normative
+        elif key == 'outliers':
+            if not self.show_overlaid_cycles:
+                return
+            self.show_outliers_only = not self.show_outliers_only
         self._update_display_btn_visuals()
         self.redraw_graph()
 
@@ -3919,11 +3943,12 @@ class GaitAnalysisDashboard(tk.Tk):
             'mean': self.show_mean,
             'data': self.show_data,
             'normal': self.show_normative,
+            'outliers': self.show_outliers_only,
         }
         for key, btn in self._display_btns.items():
             if not self.show_overlaid_cycles:
                 btn.config(bg=BG2, fg='#999999', state='disabled')
-            elif active_map[key]:
+            elif active_map.get(key, False):
                 btn.config(bg=ACCENT, fg='white', state='normal')
             else:
                 btn.config(bg=BG3, fg=TEXT, state='normal')
